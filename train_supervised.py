@@ -159,68 +159,110 @@ def load_all_graphs():
 
 
 # ============================================================================
-# Triplet Batch Generation
+# Pre-extract Patches (FAST - done once at startup)
 # ============================================================================
 
-def create_triplet_batch(graphs, batch_size=32, k_hops=2):
+def preextract_all_patches(graphs, num_patches_per_protein=50, k_hops=2):
     """
-    Create a batch of triplets (Anchor, Positive, Negative).
+    Pre-extract patches from all proteins at startup.
+    This is done ONCE and cached for fast batch sampling during training.
+    """
+    print("Pre-extracting patches (one-time operation)...")
+    
+    viral_patches = {}  # viral_id -> list of patches
+    human_patches = {}  # human_id -> list of patches
+    negative_patches = {}  # neg_id -> list of patches
+    
+    # Extract from viral and human proteins
+    for viral_id, human_id in TRUE_PAIRS:
+        if viral_id in graphs and viral_id not in viral_patches:
+            patches = []
+            data = graphs[viral_id]
+            centers = random.sample(range(data.x.size(0)), min(num_patches_per_protein * 2, data.x.size(0)))
+            for c in centers:
+                p = extract_patch(data, c, k_hops)
+                if p is not None and p.x.size(0) >= 5:
+                    patches.append(p)
+                if len(patches) >= num_patches_per_protein:
+                    break
+            viral_patches[viral_id] = patches
+            print(f"  {viral_id}: {len(patches)} patches")
+            
+        if human_id in graphs and human_id not in human_patches:
+            patches = []
+            data = graphs[human_id]
+            centers = random.sample(range(data.x.size(0)), min(num_patches_per_protein * 2, data.x.size(0)))
+            for c in centers:
+                p = extract_patch(data, c, k_hops)
+                if p is not None and p.x.size(0) >= 5:
+                    patches.append(p)
+                if len(patches) >= num_patches_per_protein:
+                    break
+            human_patches[human_id] = patches
+            print(f"  {human_id}: {len(patches)} patches")
+    
+    # Extract from negative proteins
+    for neg_id in NEGATIVE_PDBS:
+        if neg_id in graphs and neg_id not in negative_patches:
+            patches = []
+            data = graphs[neg_id]
+            centers = random.sample(range(data.x.size(0)), min(num_patches_per_protein * 2, data.x.size(0)))
+            for c in centers:
+                p = extract_patch(data, c, k_hops)
+                if p is not None and p.x.size(0) >= 5:
+                    patches.append(p)
+                if len(patches) >= num_patches_per_protein:
+                    break
+            negative_patches[neg_id] = patches
+            print(f"  {neg_id}: {len(patches)} patches")
+    
+    return viral_patches, human_patches, negative_patches
+
+
+# ============================================================================
+# Fast Triplet Batch Generation (samples from pre-extracted patches)
+# ============================================================================
+
+def create_triplet_batch_fast(viral_patches, human_patches, negative_patches, batch_size=32):
+    """
+    Create a batch of triplets by sampling from PRE-EXTRACTED patches.
+    This is FAST because no patch extraction happens during training.
     """
     anchors = []
     positives = []
     negatives = []
     
-    # We want to create 'batch_size' triplets
-    count = 0
-    attempts = 0
-    max_attempts = batch_size * 5
-    
-    while count < batch_size and attempts < max_attempts:
-        attempts += 1
-        
+    for _ in range(batch_size):
         # 1. Select a random True Pair
         viral_id, human_id = random.choice(TRUE_PAIRS)
         
         # 2. Select a random Negative protein
         neg_id = random.choice(NEGATIVE_PDBS)
         
-        # Ensure graphs exist
-        if viral_id not in graphs or human_id not in graphs or neg_id not in graphs:
+        # Check patches exist
+        if viral_id not in viral_patches or human_id not in human_patches or neg_id not in negative_patches:
+            continue
+        if not viral_patches[viral_id] or not human_patches[human_id] or not negative_patches[neg_id]:
             continue
             
-        viral_data = graphs[viral_id]
-        human_data = graphs[human_id]
-        neg_data = graphs[neg_id]
+        # 3. Sample random patches (FAST - just indexing)
+        anchor = random.choice(viral_patches[viral_id])
+        positive = random.choice(human_patches[human_id])
+        negative = random.choice(negative_patches[neg_id])
         
-        # 3. Extract random patches
-        # Anchor (Virus)
-        center_v = random.randint(0, viral_data.x.size(0) - 1)
-        anchor = extract_patch(viral_data, center_v, k_hops)
+        # 4. Apply random rotation for augmentation
+        _, anchor_aug = create_augmented_pair(anchor)
+        _, positive_aug = create_augmented_pair(positive)
+        _, negative_aug = create_augmented_pair(negative)
         
-        # Positive (Human)
-        center_h = random.randint(0, human_data.x.size(0) - 1)
-        positive = extract_patch(human_data, center_h, k_hops)
-        
-        # Negative (Decoy)
-        center_n = random.randint(0, neg_data.x.size(0) - 1)
-        negative = extract_patch(neg_data, center_n, k_hops)
-        
-        if anchor is not None and positive is not None and negative is not None:
-            # Augment: Apply random rotation to all of them to prevent overfitting
-            # We use the rotated version as the sample for robustness
-            _, anchor_aug = create_augmented_pair(anchor)
-            _, positive_aug = create_augmented_pair(positive)
-            _, negative_aug = create_augmented_pair(negative)
-            
-            anchors.append(anchor_aug)
-            positives.append(positive_aug)
-            negatives.append(negative_aug)
-            count += 1
+        anchors.append(anchor_aug)
+        positives.append(positive_aug)
+        negatives.append(negative_aug)
     
     if not anchors:
         return None, None, None
         
-    # Collate
+    # Collate into batches
     anchor_batch = Batch.from_data_list(anchors)
     positive_batch = Batch.from_data_list(positives)
     negative_batch = Batch.from_data_list(negatives)
@@ -235,11 +277,14 @@ def create_triplet_batch(graphs, batch_size=32, k_hops=2):
 def train_supervised(num_epochs=50, batch_size=32, learning_rate=1e-4, 
                      margin=1.0, device='cpu'):
     print("=" * 60)
-    print("Phase 15: Supervised Fine-Tuning (Triplet Loss)")
+    print("Phase 15: Supervised Fine-Tuning (Triplet Loss) - OPTIMIZED")
     print("=" * 60)
     
     # Load Data
     graphs = load_all_graphs()
+    
+    # PRE-EXTRACT patches once (this is the slow part, done only once)
+    viral_patches, human_patches, negative_patches = preextract_all_patches(graphs, num_patches_per_protein=100)
     
     # Initialize Model
     print("\nInitializing model...")
@@ -276,7 +321,10 @@ def train_supervised(num_epochs=50, batch_size=32, learning_rate=1e-4,
         num_batches = 10  # Fixed number of batches per epoch
         
         for _ in range(num_batches):
-            a_batch, p_batch, n_batch = create_triplet_batch(graphs, batch_size=batch_size)
+            # Use FAST batch generation (samples from pre-extracted patches)
+            a_batch, p_batch, n_batch = create_triplet_batch_fast(
+                viral_patches, human_patches, negative_patches, batch_size=batch_size
+            )
             
             if a_batch is None: continue
             
