@@ -11,6 +11,7 @@ from models.egnn import EGNN
 def process_data(raw_dir, processed_dir):
     """
     Processes PDB files from raw_dir and saves them to processed_dir.
+    Now uses ESM-2 embeddings (320-dim) for node features.
     """
     if not os.path.exists(processed_dir):
         os.makedirs(processed_dir)
@@ -36,7 +37,7 @@ def process_data(raw_dir, processed_dir):
             output_path = os.path.join(processed_dir, output_name)
             torch.save(data, output_path)
             processed_files.append(output_path)
-            print(f"Saved to {output_path}")
+            print(f"Saved to {output_path} (x shape: {data.x.shape})")
             
         except Exception as e:
             print(f"Error processing {pdb_file}: {e}")
@@ -46,6 +47,7 @@ def process_data(raw_dir, processed_dir):
 def verify_with_model(processed_files):
     """
     Loads processed files and runs them through the EGNN model to verify compatibility.
+    Updated for ESM-2 320-dimensional features.
     """
     if not processed_files:
         print("No files to verify.")
@@ -53,37 +55,43 @@ def verify_with_model(processed_files):
 
     print("\nVerifying with EGNN model...")
     
-    # Initialize model
-    # Assuming atomic numbers are used as features (embedding or one-hot needed usually)
-    # The parser returns x as atomic numbers [N, 1].
-    # The EGNN expects node_dim features. 
-    # If we pass raw atomic numbers, we might need an embedding layer first.
-    # For now, let's just project the scalar atomic number to hidden_dim if we want to be simple, 
-    # or better: One-hot encode max atomic number.
-    # But to keep it simple and consistent with previous EGNN usage:
-    # We will just pass float(x) if node_dim=1, OR we will assume the model handles it.
-    # Wait, the EGNN I wrote expects `h` of dim `node_dim`.
-    # Let's adjust the verification to include a simple embedding or projection.
+    # ========== ESM-2 Bilingual Brain Configuration ==========
+    # Input features are now 320-dimensional ESM-2 embeddings
+    # We project them down to 32 dimensions immediately to prevent
+    # the "Curse of Dimensionality" and keep training fast.
     
-    node_dim = 16
-    edge_dim = 0 # Parser doesn't return edge attributes by default
-    hidden_dim = 32
+    esm_dim = 320      # ESM-2 embedding dimension
+    node_dim = 32      # Projected dimension for EGNN
+    edge_dim = 0       # Parser doesn't return edge attributes by default
+    hidden_dim = 64    # Hidden dimension for EGNN layers
     
-    # Simple embedding layer to convert atomic number to node_dim
-    embedding = torch.nn.Embedding(100, node_dim) 
+    # Input projection: 320 -> 32 (shrink ESM embeddings immediately)
+    input_projector = torch.nn.Linear(esm_dim, node_dim)
     model = EGNN(node_dim=node_dim, edge_dim=edge_dim, hidden_dim=hidden_dim)
     
     for file_path in processed_files:
         print(f"Testing {os.path.basename(file_path)}...")
         try:
-            # We trust the data we just generated
+            # Load the processed data
             data = torch.load(file_path, weights_only=False)
             
+            # Check input dimension
+            print(f"  Input x shape: {data.x.shape}")
+            
             # Prepare inputs
-            # Ensure x is LongTensor for embedding
-            x_indices = data.x.squeeze(-1).long() # [N]
-            h = embedding(x_indices) # [N, node_dim]
-            x_coord = data.pos # [N, 3]
+            if data.x.dim() == 2 and data.x.size(1) == esm_dim:
+                # ESM-2 embeddings: [N, 320] -> project to [N, 32]
+                h = input_projector(data.x.float())
+            elif data.x.dim() == 2 and data.x.size(1) == 1:
+                # Legacy atomic numbers: use embedding
+                print("  Warning: Using legacy atomic number features")
+                embedding = torch.nn.Embedding(100, node_dim)
+                x_indices = data.x.squeeze(-1).long()
+                h = embedding(x_indices)
+            else:
+                raise ValueError(f"Unexpected input shape: {data.x.shape}")
+            
+            x_coord = data.pos  # [N, 3]
             edge_index = data.edge_index
             
             # Forward pass

@@ -16,7 +16,7 @@ from models.egnn import EGNN
 # === Configuration ===
 VIRAL_PT = 'data/processed/6H3X.pt'
 HUMAN_PT = 'data/processed/6P5R.pt'
-PATCH_RADIUS = 10.0  # Angstroms
+PATCH_RADIUS = 16.0  # Angstroms (Phase 14: increased from 10.0 for wider context)
 NODE_DIM = 16
 EDGE_DIM = 0
 HIDDEN_DIM = 32
@@ -188,6 +188,19 @@ def main():
     print("\nInitializing Siamese EGNN...")
     model = SiameseEGNN(NODE_DIM, EDGE_DIM, HIDDEN_DIM, NUM_LAYERS)
     
+    # Load trained weights
+    weights_path = os.path.join(os.path.dirname(__file__), '..', 'models', 'geomimic_net_weights.pth')
+    try:
+        model.load_state_dict(torch.load(weights_path, weights_only=True))
+        print(f"  Loaded trained weights from {weights_path}")
+    except FileNotFoundError:
+        print("  WARNING: Using random weights! Run train.py first.")
+    except Exception as e:
+        print(f"  WARNING: Could not load weights ({e}). Using random weights!")
+    
+    # Set model to evaluation mode before scanning
+    model.eval()
+
     # Generate embeddings
     print("Generating geometric embeddings...")
     viral_embeddings = embed_patches(viral_patches, model)
