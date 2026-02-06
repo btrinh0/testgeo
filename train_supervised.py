@@ -306,15 +306,18 @@ def train_supervised(num_epochs=50, batch_size=32, learning_rate=1e-4,
         print(f"  [WARNING] Pretrained weights not found at {PRETRAINED_WEIGHTS}")
         print("  Proceeding with random weights (not recommended for fine-tuning).")
         
-    # Optimizer & Loss
-    optimizer = Adam(model.parameters(), lr=learning_rate)
+    # Optimizer with weight decay (L2 regularization) to prevent overfitting
+    optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     triplet_loss = nn.TripletMarginLoss(margin=margin, p=2)
     
     model.train()
-    print(f"\nStarting training for {num_epochs} epochs...")
+    print(f"\nStarting training for {num_epochs} epochs (with early stopping)...")
     print("-" * 60)
     
     best_loss = float('inf')
+    patience_counter = 0
+    early_stop_patience = 5  # Stop if no improvement for 5 epochs
+    min_loss_threshold = 0.01  # Stop if loss goes below this (prevents overfitting)
     
     for epoch in range(1, num_epochs + 1):
         epoch_loss = 0.0
@@ -353,14 +356,26 @@ def train_supervised(num_epochs=50, batch_size=32, learning_rate=1e-4,
         if avg_loss < best_loss:
             best_loss = avg_loss
             marker = " *"
+            patience_counter = 0
             # Save best model immediately
             os.makedirs('models', exist_ok=True)
             torch.save(model.state_dict(), SAVE_PATH)
         else:
             marker = ""
+            patience_counter += 1
             
         if epoch % 5 == 0 or epoch == 1:
             print(f"Epoch {epoch:3d}/{num_epochs} | Triplet Loss: {avg_loss:.4f}{marker}")
+        
+        # Early stopping checks
+        if avg_loss < min_loss_threshold:
+            print(f"\n[EARLY STOP] Loss {avg_loss:.4f} < {min_loss_threshold} threshold.")
+            print("Stopping to prevent overfitting (memorization).")
+            break
+            
+        if patience_counter >= early_stop_patience:
+            print(f"\n[EARLY STOP] No improvement for {early_stop_patience} epochs.")
+            break
             
     print("-" * 60)
     print(f"Training complete! Best Loss: {best_loss:.4f}")
@@ -373,4 +388,6 @@ def train_supervised(num_epochs=50, batch_size=32, learning_rate=1e-4,
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
+    # Train with early stopping - will stop around epoch 10-15 before overfitting
     train_supervised(num_epochs=50, device=device)
+
