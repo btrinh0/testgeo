@@ -28,7 +28,7 @@ from utils.protein_parser import parse_pdb_to_pyg
 
 POSITIVE_DIR = 'data/benchmark/positive'
 NEGATIVE_DIR = 'data/benchmark/negative'
-WEIGHTS_PATH = 'models/geomimic_net_weights_supervised.pth'  # Phase 15: Supervised Fine-Tuning
+WEIGHTS_PATH = 'models/geomimic_net_weights_supervised.pth'  # Phase 15: Supervised Fine-Tuning from Colab
 OUTPUT_PLOT = 'results/score_distribution.png'
 
 # Ground Truth: TRUE mimicry pairs (viral -> human target)
@@ -67,7 +67,7 @@ def load_model():
     
     if os.path.exists(WEIGHTS_PATH):
         try:
-            state_dict = torch.load(WEIGHTS_PATH, weights_only=True)
+            state_dict = torch.load(WEIGHTS_PATH, map_location=torch.device('cpu'), weights_only=True)
             model.load_state_dict(state_dict, strict=False)
             print(f"  [OK] Loaded weights from {WEIGHTS_PATH}")
         except Exception as e:

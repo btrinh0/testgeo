@@ -28,7 +28,7 @@ from utils.protein_parser import parse_pdb_to_pyg
 
 POSITIVE_DIR = 'data/benchmark/positive'
 NEGATIVE_DIR = 'data/benchmark/negative'
-WEIGHTS_PATH = 'models/geomimic_net_weights.pth'
+WEIGHTS_PATH = 'models/geomimic_net_weights_supervised.pth'  # Phase 15: Supervised Fine-Tuning
 SIMILARITY_THRESHOLD = 0.85  # Above this = Match (Predicted Positive)
 
 # ============================================================================
@@ -59,20 +59,20 @@ def load_model():
     """Load the trained SiameseEGNN model."""
     print("Loading SiameseEGNN model...")
     
-    # Use same parameters as Phase 10 trained model (node_dim=32 with Cross-Attention)
+    # Use same parameters as Phase 15 trained model
     model = SiameseEGNN(
-        input_dim=320,   # ESM-2 embeddings
-        node_dim=32,     # Match Phase 10 Cross-Attention model
+        node_dim=32,     # Match trained model
         edge_dim=0,
         hidden_dim=64,
         embed_dim=128,
-        num_layers=4
+        num_layers=4,
+        geom_dim=32
     )
     
     # Load trained weights
     if os.path.exists(WEIGHTS_PATH):
         try:
-            state_dict = torch.load(WEIGHTS_PATH, weights_only=True)
+            state_dict = torch.load(WEIGHTS_PATH, map_location=torch.device('cpu'), weights_only=True)
             model.load_state_dict(state_dict, strict=False)
             print(f"  Loaded weights from {WEIGHTS_PATH}")
         except Exception as e:
