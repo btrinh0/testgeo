@@ -247,38 +247,69 @@ def preextract_all_patches(graphs, num_patches_per_protein=50, k_hops=2):
 def create_triplet_batch_fast(viral_patches, human_patches, negative_patches, batch_size=32):
     """
     Create a batch of triplets by sampling from PRE-EXTRACTED patches.
-    This is FAST because no patch extraction happens during training.
+    
+    Uses TWO types of negatives (50/50 mix):
+    1. Random negatives: unrelated proteins (hemoglobin, ubiquitin, etc.)
+    2. Cross-pair hard negatives: WRONG human targets for each viral protein
+       e.g., anchor=EBV BHRF1, positive=Bcl-2, negative=TRAF6 (wrong target)
+    
+    This teaches the model to distinguish true mimicry from structural similarity
+    to other human proteins.
     """
     anchors = []
     positives = []
     negatives = []
     
-    for _ in range(batch_size):
+    # Build lookup: viral_id -> correct human_id
+    pair_lookup = {}
+    for v, h in TRUE_PAIRS:
+        pair_lookup.setdefault(v, set()).add(h)
+    
+    # All human IDs for cross-pair negatives
+    all_human_ids = list(human_patches.keys())
+    
+    for i in range(batch_size):
         # 1. Select a random True Pair
         viral_id, human_id = random.choice(TRUE_PAIRS)
         
-        # 2. Select a random Negative protein
-        neg_id = random.choice(NEGATIVE_PDBS)
-        
         # Check patches exist
-        if viral_id not in viral_patches or human_id not in human_patches or neg_id not in negative_patches:
+        if viral_id not in viral_patches or human_id not in human_patches:
             continue
-        if not viral_patches[viral_id] or not human_patches[human_id] or not negative_patches[neg_id]:
+        if not viral_patches[viral_id] or not human_patches[human_id]:
             continue
-            
+        
+        # 2. Select negative: 50% cross-pair hard negative, 50% random negative
+        use_hard_negative = (random.random() < 0.5) and len(all_human_ids) > 1
+        
+        if use_hard_negative:
+            # Pick a WRONG human target (not the correct one for this viral)
+            correct_humans = pair_lookup.get(viral_id, set())
+            wrong_humans = [h for h in all_human_ids if h not in correct_humans and human_patches.get(h)]
+            if wrong_humans:
+                neg_id = random.choice(wrong_humans)
+                neg_patch = random.choice(human_patches[neg_id])
+            else:
+                use_hard_negative = False
+        
+        if not use_hard_negative:
+            # Random negative from unrelated proteins
+            neg_id = random.choice(NEGATIVE_PDBS)
+            if neg_id not in negative_patches or not negative_patches[neg_id]:
+                continue
+            neg_patch = random.choice(negative_patches[neg_id])
+        
         # 3. Sample random patches (FAST - just indexing)
         anchor = random.choice(viral_patches[viral_id])
         positive = random.choice(human_patches[human_id])
-        negative = random.choice(negative_patches[neg_id])
         
         # 4. Apply random rotation for augmentation
         _, anchor_aug = create_augmented_pair(anchor)
         _, positive_aug = create_augmented_pair(positive)
-        _, negative_aug = create_augmented_pair(negative)
+        _, neg_aug = create_augmented_pair(neg_patch)
         
         anchors.append(anchor_aug)
         positives.append(positive_aug)
-        negatives.append(negative_aug)
+        negatives.append(neg_aug)
     
     if not anchors:
         return None, None, None
@@ -295,10 +326,10 @@ def create_triplet_batch_fast(viral_patches, human_patches, negative_patches, ba
 # Training
 # ============================================================================
 
-def train_supervised(num_epochs=50, batch_size=32, learning_rate=1e-4, 
+def train_supervised(num_epochs=100, batch_size=32, learning_rate=1e-4, 
                      margin=1.0, device='cpu'):
     print("=" * 60)
-    print("Phase 15: Supervised Fine-Tuning (Triplet Loss) - OPTIMIZED")
+    print("Phase 22: Supervised Fine-Tuning (Cross-Pair Hard Negatives)")
     print("=" * 60)
     
     # Load Data
@@ -333,16 +364,17 @@ def train_supervised(num_epochs=50, batch_size=32, learning_rate=1e-4,
     
     model.train()
     print(f"\nStarting training for {num_epochs} epochs (with early stopping)...")
+    print(f"  Using 50% cross-pair hard negatives + 50% random negatives")
     print("-" * 60)
     
     best_loss = float('inf')
     patience_counter = 0
-    early_stop_patience = 5  # Stop if no improvement for 5 epochs
-    min_loss_threshold = 0.01  # Stop if loss goes below this (prevents overfitting)
+    early_stop_patience = 10  # Stop if no improvement for 10 epochs
+    min_loss_threshold = 0.001  # More aggressive training before stopping
     
     for epoch in range(1, num_epochs + 1):
         epoch_loss = 0.0
-        num_batches = 10  # Fixed number of batches per epoch
+        num_batches = 20  # More batches per epoch for better coverage
         
         for _ in range(num_batches):
             # Use FAST batch generation (samples from pre-extracted patches)
@@ -359,7 +391,6 @@ def train_supervised(num_epochs=50, batch_size=32, learning_rate=1e-4,
             optimizer.zero_grad()
             
             # Forward
-            # Note: We use forward_one to get embeddings
             z_a = model.forward_one(a_batch)
             z_p = model.forward_one(p_batch)
             z_n = model.forward_one(n_batch)
@@ -409,6 +440,7 @@ def train_supervised(num_epochs=50, batch_size=32, learning_rate=1e-4,
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
-    # Train with early stopping - will stop around epoch 10-15 before overfitting
-    train_supervised(num_epochs=50, device=device)
+    # Train with cross-pair hard negatives for 100 epochs
+    train_supervised(num_epochs=100, device=device)
+
 
