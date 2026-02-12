@@ -28,27 +28,45 @@ from utils.protein_parser import parse_pdb_to_pyg
 
 POSITIVE_DIR = 'data/benchmark/positive'
 NEGATIVE_DIR = 'data/benchmark/negative'
+RAW_DIR = 'data/raw'
 WEIGHTS_PATH = 'models/geomimic_net_weights_supervised.pth'  # Phase 15: Supervised Fine-Tuning
 SIMILARITY_THRESHOLD = 0.85  # Above this = Match (Predicted Positive)
 
+# Directories to search for PDB files
+PDB_DIRS = [RAW_DIR, POSITIVE_DIR, NEGATIVE_DIR]
+
 # ============================================================================
-# GROUND TRUTH: Only these are TRUE mimicry pairs
+# GROUND TRUTH: 16 validated mimicry pairs
 # ============================================================================
 TRUE_PAIRS = [
+    # Original 4
     ('1Q59', '1G5M'),  # EBV BHRF1 -> Bcl-2
     ('2V5I', '1LB5'),  # Vaccinia A52 -> TRAF6
     ('3CL3', '3H11'),  # KSHV vFLIP -> FLIP
     ('2GX9', '1KX5'),  # Flu NS1 -> Histone H3
+    # Expanded 12
+    ('2JBY', '1G5M'),  # Myxoma M11L -> Bcl-2
+    ('1B4C', '1ITB'),  # Vaccinia B15 -> IL-1R
+    ('1FV1', '1CDF'),  # EBV LMP1 -> CD40
+    ('1H26', '1CF7'),  # Adenovirus E1A -> E2F
+    ('1GUX', '1CF7'),  # HPV E7 -> E2F
+    ('1EFN', '1SHF'),  # HIV Nef -> Fyn SH3
+    ('3D2U', '1HHK'),  # CMV UL18 -> MHC-I HLA-A
+    ('2UWI', '1EXT'),  # Cowpox CrmE -> TNFR1
+    ('2BZR', '1MAZ'),  # KSHV vBcl-2 -> Bcl-xL
+    ('2VGA', '1CA9'),  # Variola CrmB -> TNFR2
+    ('1F5Q', '1B7T'),  # KSHV vCyclin -> Cyclin D2
+    ('2BBR', '1A1W'),  # Molluscum MC159 -> FADD DED
 ]
 
 # Viral proteins (known to mimic human proteins)
-VIRAL_PDBS = ['1Q59', '2V5I', '3CL3', '2GX9']
+VIRAL_PDBS = sorted(set(v for v, h in TRUE_PAIRS))
 
 # Human proteins (mimicry targets)
-HUMAN_PDBS = ['1G5M', '1LB5', '3H11', '1KX5']
+HUMAN_PDBS = sorted(set(h for v, h in TRUE_PAIRS))
 
-# Negative controls (random proteins, no mimicry expected)
-NEGATIVE_PDBS = ['1A3N', '1TRZ', '1MBN', '1UBQ']
+# Negative controls (10 unrelated proteins)
+NEGATIVE_PDBS = ['1A3N', '1TRZ', '1MBN', '1UBQ', '1LYZ', '1EMA', '4INS', '1CLL', '7RSA', '1HRC']
 
 
 # ============================================================================
@@ -86,13 +104,26 @@ def load_model():
     return model
 
 
-def load_pdb_to_graph(pdb_path):
-    """Load a PDB file and convert to PyG graph."""
+def find_pdb(pdb_id):
+    """Search multiple directories for a PDB file."""
+    for d in PDB_DIRS:
+        path = os.path.join(d, f"{pdb_id}.pdb")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def load_pdb_to_graph(pdb_id):
+    """Find and load a PDB file from any search directory."""
+    path = find_pdb(pdb_id)
+    if path is None:
+        print(f"  ERROR: {pdb_id}.pdb not found in any directory")
+        return None
     try:
-        data = parse_pdb_to_pyg(pdb_path, use_esm=True)
+        data = parse_pdb_to_pyg(path, use_esm=True)
         return data
     except Exception as e:
-        print(f"  ERROR loading {pdb_path}: {e}")
+        print(f"  ERROR loading {pdb_id}: {e}")
         return None
 
 
@@ -123,7 +154,7 @@ def is_true_pair(viral_id, human_id):
 # Benchmark Function
 # ============================================================================
 
-def run_benchmark(model, positive_dir, negative_dir):
+def run_benchmark(model):
     """
     Run comprehensive benchmark with correct ground truth labels.
     
@@ -146,35 +177,29 @@ def run_benchmark(model, positive_dir, negative_dir):
     
     # ====== Load all graphs ======
     print("\n" + "-" * 60)
-    print("Loading Viral proteins from positive/...")
+    print("Loading Viral proteins...")
     viral_graphs = {}
     for pdb_id in VIRAL_PDBS:
-        path = os.path.join(positive_dir, f"{pdb_id}.pdb")
-        if os.path.exists(path):
-            graph = load_pdb_to_graph(path)
-            if graph is not None:
-                viral_graphs[pdb_id] = graph
-                print(f"  {pdb_id}: {graph.x.size(0)} atoms")
+        graph = load_pdb_to_graph(pdb_id)
+        if graph is not None:
+            viral_graphs[pdb_id] = graph
+            print(f"  {pdb_id}: {graph.x.size(0)} atoms")
     
-    print("\nLoading Human proteins from positive/...")
+    print("\nLoading Human proteins...")
     human_graphs = {}
     for pdb_id in HUMAN_PDBS:
-        path = os.path.join(positive_dir, f"{pdb_id}.pdb")
-        if os.path.exists(path):
-            graph = load_pdb_to_graph(path)
-            if graph is not None:
-                human_graphs[pdb_id] = graph
-                print(f"  {pdb_id}: {graph.x.size(0)} atoms")
+        graph = load_pdb_to_graph(pdb_id)
+        if graph is not None:
+            human_graphs[pdb_id] = graph
+            print(f"  {pdb_id}: {graph.x.size(0)} atoms")
     
-    print("\nLoading Negative controls from negative/...")
+    print("\nLoading Negative controls...")
     negative_graphs = {}
     for pdb_id in NEGATIVE_PDBS:
-        path = os.path.join(negative_dir, f"{pdb_id}.pdb")
-        if os.path.exists(path):
-            graph = load_pdb_to_graph(path)
-            if graph is not None:
-                negative_graphs[pdb_id] = graph
-                print(f"  {pdb_id}: {graph.x.size(0)} atoms")
+        graph = load_pdb_to_graph(pdb_id)
+        if graph is not None:
+            negative_graphs[pdb_id] = graph
+            print(f"  {pdb_id}: {graph.x.size(0)} atoms")
     
     # ====== Compare ALL Viral vs Human pairs ======
     print("\n" + "=" * 60)
@@ -300,17 +325,16 @@ def compute_confusion_matrix(results):
 
 def main():
     print("=" * 60)
-    print("Phase 11: Benchmark Evaluation (Fixed)")
+    print("Phase 20: Expanded Benchmark Evaluation (16 pairs + 10 negatives)")
     print("=" * 60)
-    print(f"Positive folder: {POSITIVE_DIR}")
-    print(f"Negative folder: {NEGATIVE_DIR}")
+    print(f"PDB search dirs: {PDB_DIRS}")
     print(f"Similarity threshold: {SIMILARITY_THRESHOLD}")
     
     # Load model
     model = load_model()
     
     # Run benchmark
-    results = run_benchmark(model, POSITIVE_DIR, NEGATIVE_DIR)
+    results = run_benchmark(model)
     
     # Compute and display confusion matrix
     metrics = compute_confusion_matrix(results)

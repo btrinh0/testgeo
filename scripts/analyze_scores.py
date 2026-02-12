@@ -28,23 +28,40 @@ from utils.protein_parser import parse_pdb_to_pyg
 
 POSITIVE_DIR = 'data/benchmark/positive'
 NEGATIVE_DIR = 'data/benchmark/negative'
-WEIGHTS_PATH = 'models/geomimic_net_weights_supervised.pth'  # Phase 15: Supervised Fine-Tuning from Colab
+RAW_DIR = 'data/raw'
+WEIGHTS_PATH = 'models/geomimic_net_weights_supervised.pth'
 OUTPUT_PLOT = 'results/score_distribution.png'
 
-# Ground Truth: TRUE mimicry pairs (viral -> human target)
+# Directories to search for PDB files
+PDB_DIRS = [RAW_DIR, POSITIVE_DIR, NEGATIVE_DIR]
+
+# Ground Truth: 16 validated mimicry pairs (viral -> human target)
 TRUE_PAIRS = [
+    # Original 4
     ('1Q59', '1G5M'),  # EBV BHRF1 -> Bcl-2
     ('2V5I', '1LB5'),  # Vaccinia A52 -> TRAF6
     ('3CL3', '3H11'),  # KSHV vFLIP -> FLIP
     ('2GX9', '1KX5'),  # Flu NS1 -> Histone H3
+    # Expanded 12
+    ('2JBY', '1G5M'),  # Myxoma M11L -> Bcl-2
+    ('1B4C', '1ITB'),  # Vaccinia B15 -> IL-1R
+    ('1FV1', '1CDF'),  # EBV LMP1 -> CD40
+    ('1H26', '1CF7'),  # Adenovirus E1A -> E2F
+    ('1GUX', '1CF7'),  # HPV E7 -> E2F
+    ('1EFN', '1SHF'),  # HIV Nef -> Fyn SH3
+    ('3D2U', '1HHK'),  # CMV UL18 -> MHC-I HLA-A
+    ('2UWI', '1EXT'),  # Cowpox CrmE -> TNFR1
+    ('2BZR', '1MAZ'),  # KSHV vBcl-2 -> Bcl-xL
+    ('2VGA', '1CA9'),  # Variola CrmB -> TNFR2
+    ('1F5Q', '1B7T'),  # KSHV vCyclin -> Cyclin D2
+    ('2BBR', '1A1W'),  # Molluscum MC159 -> FADD DED
 ]
 
 # Viral proteins (known to mimic human proteins)
-VIRAL_PDBS = ['1Q59', '2V5I', '3CL3', '2GX9']
+VIRAL_PDBS = sorted(set(v for v, h in TRUE_PAIRS))
 
-# Negative controls (random proteins, no mimicry expected)
-NEGATIVE_PDBS = ['1A3N', '1TRZ', '1MBN', '1UBQ']
-# 1A3N = Hemoglobin, 1TRZ = Insulin, 1MBN = Myoglobin, 1UBQ = Ubiquitin
+# Negative controls (10 unrelated proteins)
+NEGATIVE_PDBS = ['1A3N', '1TRZ', '1MBN', '1UBQ', '1LYZ', '1EMA', '4INS', '1CLL', '7RSA', '1HRC']
 
 
 # ============================================================================
@@ -82,11 +99,20 @@ def load_model():
     return model
 
 
-def load_pdb(pdb_id, directory):
-    """Load a PDB file and convert to PyG graph."""
-    path = os.path.join(directory, f"{pdb_id}.pdb")
-    if not os.path.exists(path):
-        print(f"  [ERROR] {pdb_id}.pdb not found in {directory}")
+def find_pdb(pdb_id):
+    """Search multiple directories for a PDB file."""
+    for d in PDB_DIRS:
+        path = os.path.join(d, f"{pdb_id}.pdb")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def load_pdb(pdb_id):
+    """Find and load a PDB file from any search directory."""
+    path = find_pdb(pdb_id)
+    if path is None:
+        print(f"  [ERROR] {pdb_id}.pdb not found in any directory")
         return None
     try:
         data = parse_pdb_to_pyg(path, use_esm=True)
@@ -129,23 +155,23 @@ def analyze_scores():
     
     viral_graphs = {}
     for pdb_id in VIRAL_PDBS:
-        graph = load_pdb(pdb_id, POSITIVE_DIR)
+        graph = load_pdb(pdb_id)
         if graph is not None:
             viral_graphs[pdb_id] = graph
             print(f"  [OK] Viral {pdb_id}: {graph.x.size(0)} atoms")
     
-    # Load human targets from positive folder
+    # Load human targets
     human_graphs = {}
     for viral_id, human_id in TRUE_PAIRS:
         if human_id not in human_graphs:
-            graph = load_pdb(human_id, POSITIVE_DIR)
+            graph = load_pdb(human_id)
             if graph is not None:
                 human_graphs[human_id] = graph
                 print(f"  [OK] Human {human_id}: {graph.x.size(0)} atoms")
     
     negative_graphs = {}
     for pdb_id in NEGATIVE_PDBS:
-        graph = load_pdb(pdb_id, NEGATIVE_DIR)
+        graph = load_pdb(pdb_id)
         if graph is not None:
             negative_graphs[pdb_id] = graph
             print(f"  [OK] Negative {pdb_id}: {graph.x.size(0)} atoms")
