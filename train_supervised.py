@@ -32,19 +32,37 @@ from utils.protein_parser import parse_pdb_to_pyg
 
 POSITIVE_DIR = 'data/benchmark/positive'
 NEGATIVE_DIR = 'data/benchmark/negative'
+RAW_DIR = 'data/raw'
 PRETRAINED_WEIGHTS = 'models/geomimic_net_weights_final.pth'
 SAVE_PATH = 'models/geomimic_net_weights_supervised.pth'
 
-# Known True Pairs (Virus, Human)
+# Known True Pairs (Virus, Human) - 16 validated mimicry pairs
 TRUE_PAIRS = [
+    # Original 4
     ('1Q59', '1G5M'),  # EBV BHRF1 -> Bcl-2
     ('2V5I', '1LB5'),  # Vaccinia A52 -> TRAF6
     ('3CL3', '3H11'),  # KSHV vFLIP -> FLIP
     ('2GX9', '1KX5'),  # Flu NS1 -> Histone H3
+    # Expanded 12
+    ('2JBY', '1G5M'),  # Myxoma M11L -> Bcl-2
+    ('1B4C', '1ITB'),  # Vaccinia B15 -> IL-1R
+    ('1FV1', '1CDF'),  # EBV LMP1 -> CD40
+    ('1H26', '1CF7'),  # Adenovirus E1A -> E2F
+    ('1GUX', '1CF7'),  # HPV E7 -> E2F
+    ('1EFN', '1SHF'),  # HIV Nef -> Fyn SH3
+    ('3D2U', '1HHK'),  # CMV UL18 -> MHC-I HLA-A
+    ('2UWI', '1EXT'),  # Cowpox CrmE -> TNFR1
+    ('2BZR', '1MAZ'),  # KSHV vBcl-2 -> Bcl-xL
+    ('2VGA', '1CA9'),  # Variola CrmB -> TNFR2
+    ('1F5Q', '1B7T'),  # KSHV vCyclin -> Cyclin D2
+    ('2BBR', '1A1W'),  # Molluscum MC159 -> FADD DED
 ]
 
-# Negative Decoys
-NEGATIVE_PDBS = ['1A3N', '1TRZ', '1MBN', '1UBQ']
+# Negative Decoys - 10 unrelated proteins
+NEGATIVE_PDBS = ['1A3N', '1TRZ', '1MBN', '1UBQ', '1LYZ', '1EMA', '4INS', '1CLL', '7RSA', '1HRC']
+
+# All directories to search for PDB files
+PDB_DIRS = [RAW_DIR, POSITIVE_DIR, NEGATIVE_DIR]
 
 
 # ============================================================================
@@ -118,40 +136,43 @@ def create_augmented_pair(patch):
 # Data Loading
 # ============================================================================
 
-def load_pdb_data(pdb_id, directory):
-    """Load PDB file and return PyG Data object."""
-    path = os.path.join(directory, f"{pdb_id}.pdb")
-    if not os.path.exists(path):
-        print(f"  [ERROR] {pdb_id}.pdb not found in {directory}")
-        return None
-    try:
-        data = parse_pdb_to_pyg(path, use_esm=True)
-        return data
-    except Exception as e:
-        print(f"  [ERROR] Loading {pdb_id}: {e}")
-        return None
+def load_pdb_data(pdb_id, directories=None):
+    """Load PDB file from any of the given directories."""
+    if directories is None:
+        directories = PDB_DIRS
+    
+    for directory in directories:
+        path = os.path.join(directory, f"{pdb_id}.pdb")
+        if os.path.exists(path):
+            try:
+                data = parse_pdb_to_pyg(path, use_esm=True)
+                return data
+            except Exception as e:
+                print(f"  [ERROR] Loading {pdb_id} from {directory}: {e}")
+                return None
+    
+    print(f"  [ERROR] {pdb_id}.pdb not found in any directory")
+    return None
 
 def load_all_graphs():
     """Load all necessary protein graphs into memory."""
-    print("Loading protein graphs...")
+    print(f"Loading protein graphs ({len(TRUE_PAIRS)} pairs + {len(NEGATIVE_PDBS)} negatives)...")
     graphs = {}
     
     # Load Viral and True Human
     for viral_id, human_id in TRUE_PAIRS:
-        # Load Viral
         if viral_id not in graphs:
-            g = load_pdb_data(viral_id, POSITIVE_DIR)
+            g = load_pdb_data(viral_id)
             if g: graphs[viral_id] = g
             
-        # Load Human
         if human_id not in graphs:
-            g = load_pdb_data(human_id, POSITIVE_DIR)
+            g = load_pdb_data(human_id)
             if g: graphs[human_id] = g
             
     # Load Negatives
     for neg_id in NEGATIVE_PDBS:
         if neg_id not in graphs:
-            g = load_pdb_data(neg_id, NEGATIVE_DIR)
+            g = load_pdb_data(neg_id)
             if g: graphs[neg_id] = g
             
     print(f"  Loaded {len(graphs)} proteins.")
