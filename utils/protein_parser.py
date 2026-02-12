@@ -4,7 +4,21 @@ from Bio.PDB import PDBParser
 from Bio.PDB.Polypeptide import is_aa
 from Bio.SeqUtils import seq1
 import numpy as np
-import esm
+try:
+    import esm
+    # Verify it's the correct ESM package (fair-esm, not the other 'esm')
+    if not hasattr(esm, 'pretrained'):
+        raise ImportError(
+            "Wrong 'esm' package installed! You need 'fair-esm'.\n"
+            "Fix: pip uninstall esm -y && pip install fair-esm"
+        )
+except ImportError as e:
+    if 'pretrained' in str(e):
+        raise  # Re-raise our custom error
+    raise ImportError(
+        "ESM package not found. Install with: pip install fair-esm\n"
+        "WARNING: Do NOT use 'pip install esm' - that is a different package!"
+    ) from e
 
 # ========== ESM-2 Model Singleton ==========
 # Load once and reuse for efficiency
