@@ -402,8 +402,9 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
             print(f"  [INFO] Could not load weights: {e}")
             print("  Training from scratch with new architecture.")
     
-    # NT-Xent Loss (temperature=0.5, standard SimCLR value; 0.07 was too low causing loss collapse)
-    criterion = NTXentLoss(temperature=0.5)
+    # Triplet Margin Loss with hard negative mining
+    # Proven approach: margin=1.0 keeps gradients flowing, multi-neg mining picks hardest
+    criterion = nn.TripletMarginLoss(margin=1.0, p=2)
     
     # Optimizer with weight decay
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
@@ -413,37 +414,33 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
     
     model.train()
     num_batches = 30
-    num_negatives = 4  # 4 negatives per anchor for NT-Xent
+    num_negatives = 4  # Forward 4 negatives, pick hardest per anchor
     
     print(f"\nTraining Config:")
     print(f"  Epochs:        {num_epochs}")
     print(f"  Batch size:    {batch_size}")
     print(f"  Batches/epoch: {num_batches}")
-    print(f"  Negatives/sample: {num_negatives}")
-    print(f"  Loss:          NT-Xent (temperature=0.5)")
+    print(f"  Negatives/sample: {num_negatives} (hardest selected)")
+    print(f"  Loss:          TripletMargin (margin=1.0) + hard mining")
     print(f"  LR:            {learning_rate} -> cosine annealing")
-    print(f"  Curriculum:    30% hard(1-30) -> ramp(30-100) -> 90% hard(100+)")
+    print(f"  Curriculum:    20% hard(1-30) -> ramp(30-100) -> 80% hard(100+)")
     print("-" * 60)
     
     best_loss = float('inf')
     patience_counter = 0
     early_stop_patience = 40
     min_epochs_before_stop = 100
-    loss_collapsed = False  # Track if loss hit zero (need harder negatives)
     
     for epoch in range(1, num_epochs + 1):
         epoch_loss = 0.0
         
         # Curriculum learning: gradually increase hard negative ratio
-        # Start with 30% hard (not 10%!) to prevent trivial loss collapse
-        if loss_collapsed:
-            hard_ratio = 0.9  # If loss hit zero, force hard negatives
-        elif epoch <= 30:
-            hard_ratio = 0.3  # Phase 1: moderate difficulty
+        if epoch <= 30:
+            hard_ratio = 0.2  # Phase 1: mostly easy
         elif epoch <= 100:
-            hard_ratio = 0.3 + 0.6 * ((epoch - 30) / 70)  # Phase 2: ramp to 90%
+            hard_ratio = 0.2 + 0.6 * ((epoch - 30) / 70)  # Phase 2: ramp
         else:
-            hard_ratio = 0.9  # Phase 3: mostly hard negatives
+            hard_ratio = 0.8  # Phase 3: mostly hard
         
         for _ in range(num_batches):
             a_batch, p_batch, neg_batches = create_ntxent_batch(
@@ -461,13 +458,23 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
             
             optimizer.zero_grad()
             
-            # Forward
+            # Forward all
             z_a = model.forward_one(a_batch)
             z_p = model.forward_one(p_batch)
             z_neg_list = [model.forward_one(nb) for nb in neg_batches]
             
-            # NT-Xent Loss (all negatives simultaneously)
-            loss = criterion(z_a, z_p, z_neg_list)
+            # Hard negative mining: pick the negative closest to anchor
+            # This is the hardest negative - the one the model struggles with most
+            neg_dists = [F.pairwise_distance(z_a, z_neg, p=2) for z_neg in z_neg_list]
+            neg_dists_stack = torch.stack(neg_dists, dim=1)  # [B, K]
+            hardest_idx = neg_dists_stack.argmin(dim=1)  # [B] - closest = hardest
+            
+            # Gather hardest negative per sample
+            z_neg_stack = torch.stack(z_neg_list, dim=1)  # [B, K, D]
+            z_hard_neg = z_neg_stack[torch.arange(z_a.size(0)), hardest_idx]  # [B, D]
+            
+            # Triplet loss with hardest negative
+            loss = criterion(z_a, z_p, z_hard_neg)
             
             loss.backward()
             
@@ -482,11 +489,6 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
         
         avg_loss = epoch_loss / num_batches
         current_lr = optimizer.param_groups[0]['lr']
-        
-        # Detect loss collapse and force harder negatives
-        if avg_loss < 1e-6 and not loss_collapsed:
-            loss_collapsed = True
-            print(f"  [!] Loss collapsed to ~0 at epoch {epoch}. Switching to 90% hard negatives.")
         
         if avg_loss < best_loss:
             best_loss = avg_loss
