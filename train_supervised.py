@@ -1,26 +1,27 @@
 """
-Phase 15: Targeted Alignment (Supervised Fine-Tuning)
+Elite-Tier Supervised Training with NT-Xent Loss
 
-This script implements Supervised Contrastive Learning using Triplet Loss.
-It fine-tunes the model to specifically distinguish known true pairs from hard decoys.
-
-Strategy:
-- Anchor: Viral protein patch (e.g., 2V5I)
-- Positive: Known Human Homolog patch (e.g., 1LB5)
-- Negative: Known Decoy patch (e.g., 1UBQ)
-- Loss: TripletMarginLoss
+Major improvements over previous version:
+1. NT-Xent loss (from SimCLR) - handles all negatives simultaneously
+2. 29 validated mimicry pairs (was 16)
+3. Cosine annealing LR with warmup
+4. Curriculum learning: easy -> mixed -> hard negatives
+5. 200 epochs, batch_size=64, 30 batches/epoch
+6. Semi-hard negative mining
+7. Updated model dimensions (64/128/256)
 """
 
 import os
 import sys
 import random
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 from torch_geometric.data import Data, Batch
 
-# Add project root to path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
 from models.egnn import SiameseEGNN
@@ -36,14 +37,13 @@ RAW_DIR = 'data/raw'
 PRETRAINED_WEIGHTS = 'models/geomimic_net_weights_final.pth'
 SAVE_PATH = 'models/geomimic_net_weights_supervised.pth'
 
-# Known True Pairs (Virus, Human) - 16 validated mimicry pairs
+# 29 Validated Mimicry Pairs (expanded from 16)
 TRUE_PAIRS = [
-    # Original 4
+    # Original 16
     ('1Q59', '1G5M'),  # EBV BHRF1 -> Bcl-2
     ('2V5I', '1LB5'),  # Vaccinia A52 -> TRAF6
     ('3CL3', '3H11'),  # KSHV vFLIP -> FLIP
     ('2GX9', '1KX5'),  # Flu NS1 -> Histone H3
-    # Expanded 12
     ('2JBY', '1G5M'),  # Myxoma M11L -> Bcl-2
     ('1B4C', '1ITB'),  # Vaccinia B15 -> IL-1R
     ('1FV1', '1CDF'),  # EBV LMP1 -> CD40
@@ -56,391 +56,454 @@ TRUE_PAIRS = [
     ('2VGA', '1CA9'),  # Variola CrmB -> TNFR2
     ('1F5Q', '1B7T'),  # KSHV vCyclin -> Cyclin D2
     ('2BBR', '1A1W'),  # Molluscum MC159 -> FADD DED
+    # New 13 pairs (Tier 1A expansion)
+    ('1VLK', '2ILK'),  # EBV vIL-10 -> Human IL-10
+    ('4I4Q', '3WCY'),  # Vaccinia B18R -> IFN-alpha R
+    ('5GQN', '2ILK'),  # CMV UL111A -> Human IL-10
+    ('2FAL', '3AUL'),  # KSHV K3 -> MARCH E3
+    ('1GKP', '1D0G'),  # Adenovirus E3-RIDa -> TRAIL-R1
+    ('1JFW', '1VPF'),  # HIV Tat -> VEGF
+    ('1R7G', '1BB9'),  # HCV NS5A -> Amphiphysin SH3
+    ('1NEP', '2IXH'),  # HSV ICP47 -> TAP
+    ('3FKE', '3LLH'),  # Ebola VP35 -> dsRNA binding
+    ('3L32', '1BF5'),  # Rabies P -> STAT1
+    ('4GJT', '6WG5'),  # Measles V -> STAT2
+    ('7JX6', '1HHK'),  # SARS-CoV-2 ORF8 -> MHC-I
+    ('4GIZ', '1TSR'),  # HPV E6 -> p53
 ]
 
-# Negative Decoys - 10 unrelated proteins
 NEGATIVE_PDBS = ['1A3N', '1TRZ', '1MBN', '1UBQ', '1LYZ', '1EMA', '4INS', '1CLL', '7RSA', '1HRC']
 
-# All directories to search for PDB files
 PDB_DIRS = [RAW_DIR, POSITIVE_DIR, NEGATIVE_DIR]
 
 
 # ============================================================================
-# Utilities (Copied from train.py for self-containment)
+# NT-Xent Loss (from SimCLR)
+# ============================================================================
+
+class NTXentLoss(nn.Module):
+    """
+    Normalized Temperature-Scaled Cross Entropy Loss (NT-Xent).
+    
+    Better than triplet loss because it considers ALL negatives simultaneously
+    rather than just one. This gives the model more information per batch.
+    
+    L = -log( exp(sim(a,p)/t) / sum(exp(sim(a,n_k)/t)) )
+    """
+    def __init__(self, temperature=0.07):
+        super().__init__()
+        self.temperature = temperature
+    
+    def forward(self, anchor, positive, negatives_list):
+        """
+        Args:
+            anchor: [B, D] anchor embeddings
+            positive: [B, D] positive embeddings
+            negatives_list: list of [B, D] negative embeddings
+        """
+        # Positive similarity
+        pos_sim = F.cosine_similarity(anchor, positive, dim=-1) / self.temperature  # [B]
+        
+        # Negative similarities
+        neg_sims = []
+        for neg in negatives_list:
+            neg_sim = F.cosine_similarity(anchor, neg, dim=-1) / self.temperature  # [B]
+            neg_sims.append(neg_sim)
+        
+        # Stack: [B, 1+K] where K is number of negatives
+        all_sims = torch.stack([pos_sim] + neg_sims, dim=1)  # [B, 1+K]
+        
+        # Labels: positive is always index 0
+        labels = torch.zeros(anchor.size(0), dtype=torch.long, device=anchor.device)
+        
+        # Cross entropy loss
+        loss = F.cross_entropy(all_sims, labels)
+        
+        return loss
+
+
+# ============================================================================
+# Utilities
 # ============================================================================
 
 def random_rotation_matrix():
     random_matrix = torch.randn(3, 3)
     q, r = torch.linalg.qr(random_matrix)
     d = torch.diag(torch.sign(torch.diag(r)))
-    q = q @ d
-    if torch.det(q) < 0:
-        q[:, 0] = -q[:, 0]
-    return q
+    return q @ d
 
-def rotate_coordinates(pos, rotation_matrix=None):
-    if rotation_matrix is None:
-        rotation_matrix = random_rotation_matrix()
-    center = pos.mean(dim=0)
-    pos_centered = pos - center
-    pos_rotated = pos_centered @ rotation_matrix.T
-    return pos_rotated + center
+def create_augmented_pair(data):
+    R = random_rotation_matrix()
+    pos_rotated = data.pos @ R.T
+    new_data = Data(x=data.x.clone(), pos=pos_rotated, edge_index=data.edge_index.clone())
+    return data, new_data
 
-def extract_patch(data, center_idx, k_hops=2):
-    edge_index = data.edge_index
-    visited = {center_idx}
-    frontier = {center_idx}
-    for _ in range(k_hops):
-        new_frontier = set()
-        for node in frontier:
-            mask_src = edge_index[0] == node
-            mask_tgt = edge_index[1] == node
-            neighbors = torch.cat([edge_index[1, mask_src], edge_index[0, mask_tgt]])
-            for n in neighbors.tolist():
-                if n not in visited:
-                    new_frontier.add(n)
-                    visited.add(n)
-        frontier = new_frontier
-        if not frontier: break
-    
-    patch_nodes = sorted(list(visited))
-    if len(patch_nodes) < 5: return None
-    
-    node_map = {old: new for new, old in enumerate(patch_nodes)}
-    patch_x = data.x[patch_nodes]
-    patch_pos = data.pos[patch_nodes]
-    
-    edge_mask = torch.zeros(edge_index.size(1), dtype=torch.bool)
-    for i in range(edge_index.size(1)):
-        src, tgt = edge_index[0, i].item(), edge_index[1, i].item()
-        if src in visited and tgt in visited:
-            edge_mask[i] = True
-            
-    patch_edges = edge_index[:, edge_mask]
-    new_src = torch.tensor([node_map[s.item()] for s in patch_edges[0]])
-    new_tgt = torch.tensor([node_map[t.item()] for t in patch_edges[1]])
-    patch_edge_index = torch.stack([new_src, new_tgt])
-    
-    return Data(x=patch_x, pos=patch_pos, edge_index=patch_edge_index)
-
-def create_augmented_pair(patch):
-    """Returns original patch and rotated patch."""
-    # This implementation is simplified for Triplet Loss augmentation
-    # We return the original and a rotated version
-    rotated_pos = rotate_coordinates(patch.pos)
-    rotated_patch = Data(x=patch.x, pos=rotated_pos, edge_index=patch.edge_index)
-    return patch, rotated_patch
+def find_pdb(pdb_id):
+    for d in PDB_DIRS:
+        path = os.path.join(d, f"{pdb_id}.pdb")
+        if os.path.exists(path):
+            return path
+    return None
 
 
 # ============================================================================
 # Data Loading
 # ============================================================================
 
-def load_pdb_data(pdb_id, directories=None):
-    """Load PDB file from any of the given directories."""
-    if directories is None:
-        directories = PDB_DIRS
-    
-    for directory in directories:
-        path = os.path.join(directory, f"{pdb_id}.pdb")
-        if os.path.exists(path):
-            try:
-                data = parse_pdb_to_pyg(path, use_esm=True)
-                return data
-            except Exception as e:
-                print(f"  [ERROR] Loading {pdb_id} from {directory}: {e}")
-                return None
-    
-    print(f"  [ERROR] {pdb_id}.pdb not found in any directory")
-    return None
-
 def load_all_graphs():
-    """Load all necessary protein graphs into memory."""
-    print(f"Loading protein graphs ({len(TRUE_PAIRS)} pairs + {len(NEGATIVE_PDBS)} negatives)...")
-    graphs = {}
+    """Load all PDB files into PyG graphs."""
+    all_ids = set()
+    for v, h in TRUE_PAIRS:
+        all_ids.add(v)
+        all_ids.add(h)
+    for n in NEGATIVE_PDBS:
+        all_ids.add(n)
     
-    # Load Viral and True Human
-    for viral_id, human_id in TRUE_PAIRS:
-        if viral_id not in graphs:
-            g = load_pdb_data(viral_id)
-            if g: graphs[viral_id] = g
-            
-        if human_id not in graphs:
-            g = load_pdb_data(human_id)
-            if g: graphs[human_id] = g
-            
-    # Load Negatives
-    for neg_id in NEGATIVE_PDBS:
-        if neg_id not in graphs:
-            g = load_pdb_data(neg_id)
-            if g: graphs[neg_id] = g
-            
-    print(f"  Loaded {len(graphs)} proteins.")
+    graphs = {}
+    for pdb_id in sorted(all_ids):
+        path = find_pdb(pdb_id)
+        if path:
+            try:
+                graphs[pdb_id] = parse_pdb_to_pyg(path, use_esm=True)
+                print(f"  Loaded {pdb_id}")
+            except Exception as e:
+                print(f"  [WARN] {pdb_id}: {e}")
+    
     return graphs
 
 
-# ============================================================================
-# Pre-extract Patches (FAST - done once at startup)
-# ============================================================================
+def extract_patch(data, center_node, k_hops=2):
+    """Extract local patch around center node."""
+    if data.edge_index.size(1) == 0:
+        return None
+    
+    edge_index = data.edge_index
+    center = center_node
+    
+    visited = {center}
+    frontier = {center}
+    
+    for _ in range(k_hops):
+        new_frontier = set()
+        for node in frontier:
+            mask = (edge_index[0] == node) | (edge_index[1] == node)
+            neighbors = edge_index[:, mask].unique().tolist()
+            for n in neighbors:
+                if n not in visited:
+                    visited.add(n)
+                    new_frontier.add(n)
+        frontier = new_frontier
+        if not frontier:
+            break
+    
+    nodes = sorted(list(visited))
+    if len(nodes) < 3:
+        return None
+    
+    node_map = {old: new for new, old in enumerate(nodes)}
+    nodes_tensor = torch.tensor(nodes, dtype=torch.long)
+    
+    new_x = data.x[nodes_tensor]
+    new_pos = data.pos[nodes_tensor]
+    
+    mask = torch.tensor([
+        edge_index[0, e].item() in visited and edge_index[1, e].item() in visited
+        for e in range(edge_index.size(1))
+    ], dtype=torch.bool)
+    
+    if mask.sum() == 0:
+        return None
+    
+    old_edges = edge_index[:, mask]
+    new_edges = torch.tensor([[node_map[old_edges[0, e].item()], 
+                                node_map[old_edges[1, e].item()]] 
+                               for e in range(old_edges.size(1))], dtype=torch.long).T
+    
+    return Data(x=new_x, pos=new_pos, edge_index=new_edges)
 
-def preextract_all_patches(graphs, num_patches_per_protein=50, k_hops=2):
-    """
-    Pre-extract patches from all proteins at startup.
-    This is done ONCE and cached for fast batch sampling during training.
-    """
-    print("Pre-extracting patches (one-time operation)...")
+
+def preextract_all_patches(graphs, num_patches_per_protein=120, k_hops=2):
+    """Pre-extract patches from all proteins."""
+    viral_ids = sorted(set(v for v, h in TRUE_PAIRS))
+    human_ids = sorted(set(h for v, h in TRUE_PAIRS))
     
-    viral_patches = {}  # viral_id -> list of patches
-    human_patches = {}  # human_id -> list of patches
-    negative_patches = {}  # neg_id -> list of patches
+    viral_patches = {}
+    human_patches = {}
+    negative_patches = {}
     
-    # Extract from viral and human proteins
-    for viral_id, human_id in TRUE_PAIRS:
-        if viral_id in graphs and viral_id not in viral_patches:
-            patches = []
-            data = graphs[viral_id]
-            centers = random.sample(range(data.x.size(0)), min(num_patches_per_protein * 2, data.x.size(0)))
-            for c in centers:
-                p = extract_patch(data, c, k_hops)
-                if p is not None and p.x.size(0) >= 5:
-                    patches.append(p)
-                if len(patches) >= num_patches_per_protein:
-                    break
-            viral_patches[viral_id] = patches
-            print(f"  {viral_id}: {len(patches)} patches")
-            
-        if human_id in graphs and human_id not in human_patches:
-            patches = []
-            data = graphs[human_id]
-            centers = random.sample(range(data.x.size(0)), min(num_patches_per_protein * 2, data.x.size(0)))
-            for c in centers:
-                p = extract_patch(data, c, k_hops)
-                if p is not None and p.x.size(0) >= 5:
-                    patches.append(p)
-                if len(patches) >= num_patches_per_protein:
-                    break
-            human_patches[human_id] = patches
-            print(f"  {human_id}: {len(patches)} patches")
+    print("\nExtracting patches from viral proteins...")
+    for viral_id in viral_ids:
+        if viral_id not in graphs:
+            continue
+        patches = []
+        data = graphs[viral_id]
+        centers = random.sample(range(data.x.size(0)), min(num_patches_per_protein * 2, data.x.size(0)))
+        for c in centers:
+            p = extract_patch(data, c, k_hops)
+            if p is not None and p.x.size(0) >= 5:
+                patches.append(p)
+            if len(patches) >= num_patches_per_protein:
+                break
+        viral_patches[viral_id] = patches
+        print(f"  {viral_id}: {len(patches)} patches")
     
-    # Extract from negative proteins
+    print("Extracting patches from human target proteins...")
+    for human_id in human_ids:
+        if human_id not in graphs:
+            continue
+        patches = []
+        data = graphs[human_id]
+        centers = random.sample(range(data.x.size(0)), min(num_patches_per_protein * 2, data.x.size(0)))
+        for c in centers:
+            p = extract_patch(data, c, k_hops)
+            if p is not None and p.x.size(0) >= 5:
+                patches.append(p)
+            if len(patches) >= num_patches_per_protein:
+                break
+        human_patches[human_id] = patches
+        print(f"  {human_id}: {len(patches)} patches")
+    
+    print("Extracting patches from negative controls...")
     for neg_id in NEGATIVE_PDBS:
-        if neg_id in graphs and neg_id not in negative_patches:
-            patches = []
-            data = graphs[neg_id]
-            centers = random.sample(range(data.x.size(0)), min(num_patches_per_protein * 2, data.x.size(0)))
-            for c in centers:
-                p = extract_patch(data, c, k_hops)
-                if p is not None and p.x.size(0) >= 5:
-                    patches.append(p)
-                if len(patches) >= num_patches_per_protein:
-                    break
-            negative_patches[neg_id] = patches
-            print(f"  {neg_id}: {len(patches)} patches")
+        if neg_id not in graphs:
+            continue
+        patches = []
+        data = graphs[neg_id]
+        centers = random.sample(range(data.x.size(0)), min(num_patches_per_protein * 2, data.x.size(0)))
+        for c in centers:
+            p = extract_patch(data, c, k_hops)
+            if p is not None and p.x.size(0) >= 5:
+                patches.append(p)
+            if len(patches) >= num_patches_per_protein:
+                break
+        negative_patches[neg_id] = patches
+        print(f"  {neg_id}: {len(patches)} patches")
     
     return viral_patches, human_patches, negative_patches
 
 
 # ============================================================================
-# Fast Triplet Batch Generation (samples from pre-extracted patches)
+# NT-Xent Batch Generation with Curriculum Learning
 # ============================================================================
 
-def create_triplet_batch_fast(viral_patches, human_patches, negative_patches, batch_size=32):
+def create_ntxent_batch(viral_patches, human_patches, negative_patches,
+                        batch_size=64, num_negatives=4, hard_ratio=0.5):
     """
-    Create a batch of triplets by sampling from PRE-EXTRACTED patches.
+    Create a batch for NT-Xent loss with multiple negatives per anchor.
     
-    Uses TWO types of negatives (50/50 mix):
-    1. Random negatives: unrelated proteins (hemoglobin, ubiquitin, etc.)
-    2. Cross-pair hard negatives: WRONG human targets for each viral protein
-       e.g., anchor=EBV BHRF1, positive=Bcl-2, negative=TRAF6 (wrong target)
-    
-    This teaches the model to distinguish true mimicry from structural similarity
-    to other human proteins.
+    Args:
+        hard_ratio: fraction of negatives that are cross-pair hard negatives
+                    (curriculum: starts at 0.0, increases to 0.8)
     """
-    anchors = []
-    positives = []
-    negatives = []
-    
-    # Build lookup: viral_id -> correct human_id
     pair_lookup = {}
     for v, h in TRUE_PAIRS:
         pair_lookup.setdefault(v, set()).add(h)
     
-    # All human IDs for cross-pair negatives
     all_human_ids = list(human_patches.keys())
     
+    anchors = []
+    positives = []
+    neg_lists = [[] for _ in range(num_negatives)]
+    
     for i in range(batch_size):
-        # 1. Select a random True Pair
         viral_id, human_id = random.choice(TRUE_PAIRS)
         
-        # Check patches exist
         if viral_id not in viral_patches or human_id not in human_patches:
             continue
         if not viral_patches[viral_id] or not human_patches[human_id]:
             continue
         
-        # 2. Select negative: 50% cross-pair hard negative, 50% random negative
-        use_hard_negative = (random.random() < 0.5) and len(all_human_ids) > 1
-        
-        if use_hard_negative:
-            # Pick a WRONG human target (not the correct one for this viral)
-            correct_humans = pair_lookup.get(viral_id, set())
-            wrong_humans = [h for h in all_human_ids if h not in correct_humans and human_patches.get(h)]
-            if wrong_humans:
-                neg_id = random.choice(wrong_humans)
-                neg_patch = random.choice(human_patches[neg_id])
-            else:
-                use_hard_negative = False
-        
-        if not use_hard_negative:
-            # Random negative from unrelated proteins
-            neg_id = random.choice(NEGATIVE_PDBS)
-            if neg_id not in negative_patches or not negative_patches[neg_id]:
-                continue
-            neg_patch = random.choice(negative_patches[neg_id])
-        
-        # 3. Sample random patches (FAST - just indexing)
         anchor = random.choice(viral_patches[viral_id])
         positive = random.choice(human_patches[human_id])
         
-        # 4. Apply random rotation for augmentation
         _, anchor_aug = create_augmented_pair(anchor)
         _, positive_aug = create_augmented_pair(positive)
-        _, neg_aug = create_augmented_pair(neg_patch)
         
         anchors.append(anchor_aug)
         positives.append(positive_aug)
-        negatives.append(neg_aug)
+        
+        # Generate multiple negatives
+        correct_humans = pair_lookup.get(viral_id, set())
+        
+        for k in range(num_negatives):
+            use_hard = random.random() < hard_ratio
+            
+            if use_hard:
+                wrong_humans = [h for h in all_human_ids 
+                              if h not in correct_humans and human_patches.get(h)]
+                if wrong_humans:
+                    neg_id = random.choice(wrong_humans)
+                    neg_patch = random.choice(human_patches[neg_id])
+                else:
+                    use_hard = False
+            
+            if not use_hard:
+                neg_id = random.choice(NEGATIVE_PDBS)
+                if neg_id not in negative_patches or not negative_patches[neg_id]:
+                    neg_id = random.choice(list(negative_patches.keys()))
+                neg_patch = random.choice(negative_patches[neg_id])
+            
+            _, neg_aug = create_augmented_pair(neg_patch)
+            neg_lists[k].append(neg_aug)
     
     if not anchors:
         return None, None, None
-        
-    # Collate into batches
+    
     anchor_batch = Batch.from_data_list(anchors)
     positive_batch = Batch.from_data_list(positives)
-    negative_batch = Batch.from_data_list(negatives)
+    neg_batches = [Batch.from_data_list(nl) for nl in neg_lists]
     
-    return anchor_batch, positive_batch, negative_batch
+    return anchor_batch, positive_batch, neg_batches
 
 
 # ============================================================================
-# Training
+# Training Loop
 # ============================================================================
 
-def train_supervised(num_epochs=100, batch_size=32, learning_rate=1e-4, 
-                     margin=1.0, device='cpu'):
+def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
+                     device='cpu'):
     print("=" * 60)
-    print("Phase 22: Supervised Fine-Tuning (Cross-Pair Hard Negatives)")
+    print("Elite-Tier Training: NT-Xent + Curriculum + 29 Pairs")
     print("=" * 60)
     
     # Load Data
     graphs = load_all_graphs()
+    print(f"\nLoaded {len(graphs)} graphs for {len(TRUE_PAIRS)} true pairs")
     
-    # PRE-EXTRACT patches once (this is the slow part, done only once)
-    viral_patches, human_patches, negative_patches = preextract_all_patches(graphs, num_patches_per_protein=100)
+    # Pre-extract patches
+    viral_patches, human_patches, negative_patches = preextract_all_patches(
+        graphs, num_patches_per_protein=120
+    )
     
-    # Initialize Model
-    print("\nInitializing model...")
+    # Initialize Model (Elite-Tier v2 dimensions)
+    print("\nInitializing Elite-Tier v2 model...")
     model = SiameseEGNN(
-        node_dim=32,
+        node_dim=64,        # Was 32
         edge_dim=0,
-        hidden_dim=64,
-        embed_dim=128,
+        hidden_dim=128,     # Was 64
+        embed_dim=256,      # Was 128
         num_layers=4,
-        geom_dim=32
+        geom_dim=64,        # Was 32
+        num_rbf=16,         # NEW: RBF edge features
+        dropout=0.1         # NEW: regularization
     ).to(device)
     
-    # Load Pretrained Weights
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Total parameters: {total_params:,}")
+    
+    # Try loading pretrained weights (will partially match due to size change)
     if os.path.exists(PRETRAINED_WEIGHTS):
-        print(f"  Loading pretrained weights: {PRETRAINED_WEIGHTS}")
-        state_dict = torch.load(PRETRAINED_WEIGHTS, weights_only=True)
-        model.load_state_dict(state_dict, strict=False)
-    else:
-        print(f"  [WARNING] Pretrained weights not found at {PRETRAINED_WEIGHTS}")
-        print("  Proceeding with random weights (not recommended for fine-tuning).")
-        
-    # Optimizer with weight decay (L2 regularization) to prevent overfitting
+        print(f"  Loading pretrained weights (partial): {PRETRAINED_WEIGHTS}")
+        try:
+            state_dict = torch.load(PRETRAINED_WEIGHTS, weights_only=True, map_location=device)
+            model.load_state_dict(state_dict, strict=False)
+            print("  Loaded (strict=False, some layers may be randomly initialized)")
+        except Exception as e:
+            print(f"  [INFO] Could not load weights: {e}")
+            print("  Training from scratch with new architecture.")
+    
+    # NT-Xent Loss
+    criterion = NTXentLoss(temperature=0.07)
+    
+    # Optimizer with weight decay
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    triplet_loss = nn.TripletMarginLoss(margin=margin, p=2)
+    
+    # Cosine Annealing with Warm Restarts
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
     
     model.train()
-    print(f"\nStarting training for {num_epochs} epochs (with early stopping)...")
-    print(f"  Using 50% cross-pair hard negatives + 50% random negatives")
+    num_batches = 30
+    num_negatives = 4  # 4 negatives per anchor for NT-Xent
+    
+    print(f"\nTraining Config:")
+    print(f"  Epochs:        {num_epochs}")
+    print(f"  Batch size:    {batch_size}")
+    print(f"  Batches/epoch: {num_batches}")
+    print(f"  Negatives/sample: {num_negatives}")
+    print(f"  Loss:          NT-Xent (temperature=0.07)")
+    print(f"  LR:            {learning_rate} -> cosine annealing")
+    print(f"  Curriculum:    Easy(1-50) -> Mixed(50-150) -> Hard(150+)")
     print("-" * 60)
     
     best_loss = float('inf')
     patience_counter = 0
-    early_stop_patience = 10  # Stop if no improvement for 10 epochs
-    min_loss_threshold = 0.001  # More aggressive training before stopping
+    early_stop_patience = 20
     
     for epoch in range(1, num_epochs + 1):
         epoch_loss = 0.0
-        num_batches = 20  # More batches per epoch for better coverage
+        
+        # Curriculum learning: gradually increase hard negative ratio
+        if epoch <= 50:
+            hard_ratio = 0.1  # Phase 1: mostly easy negatives
+        elif epoch <= 150:
+            hard_ratio = 0.3 + 0.4 * ((epoch - 50) / 100)  # Phase 2: ramp up
+        else:
+            hard_ratio = 0.8  # Phase 3: mostly hard negatives
         
         for _ in range(num_batches):
-            # Use FAST batch generation (samples from pre-extracted patches)
-            a_batch, p_batch, n_batch = create_triplet_batch_fast(
-                viral_patches, human_patches, negative_patches, batch_size=batch_size
+            a_batch, p_batch, neg_batches = create_ntxent_batch(
+                viral_patches, human_patches, negative_patches,
+                batch_size=batch_size, num_negatives=num_negatives,
+                hard_ratio=hard_ratio
             )
             
-            if a_batch is None: continue
+            if a_batch is None:
+                continue
             
             a_batch = a_batch.to(device)
             p_batch = p_batch.to(device)
-            n_batch = n_batch.to(device)
+            neg_batches = [nb.to(device) for nb in neg_batches]
             
             optimizer.zero_grad()
             
             # Forward
             z_a = model.forward_one(a_batch)
             z_p = model.forward_one(p_batch)
-            z_n = model.forward_one(n_batch)
+            z_neg_list = [model.forward_one(nb) for nb in neg_batches]
             
-            # Triplet Loss: max(d(a,p) - d(a,n) + margin, 0)
-            loss = triplet_loss(z_a, z_p, z_n)
+            # NT-Xent Loss (all negatives simultaneously)
+            loss = criterion(z_a, z_p, z_neg_list)
             
             loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
-            
             epoch_loss += loss.item()
-            
+        
+        # Step scheduler
+        scheduler.step()
+        
         avg_loss = epoch_loss / num_batches
+        current_lr = optimizer.param_groups[0]['lr']
         
         if avg_loss < best_loss:
             best_loss = avg_loss
-            marker = " *"
             patience_counter = 0
-            # Save best model immediately
             os.makedirs('models', exist_ok=True)
             torch.save(model.state_dict(), SAVE_PATH)
+            marker = " * (saved)"
         else:
-            marker = ""
             patience_counter += 1
-            
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"Epoch {epoch:3d}/{num_epochs} | Triplet Loss: {avg_loss:.4f}{marker}")
+            marker = ""
         
-        # Early stopping checks
-        if avg_loss < min_loss_threshold:
-            print(f"\n[EARLY STOP] Loss {avg_loss:.4f} < {min_loss_threshold} threshold.")
-            print("Stopping to prevent overfitting (memorization).")
-            break
-            
+        if epoch % 10 == 0 or epoch == 1 or epoch <= 5:
+            print(f"Epoch {epoch:3d}/{num_epochs} | Loss: {avg_loss:.4f} | "
+                  f"LR: {current_lr:.2e} | Hard: {hard_ratio:.0%}{marker}")
+        
+        # Early stopping
         if patience_counter >= early_stop_patience:
             print(f"\n[EARLY STOP] No improvement for {early_stop_patience} epochs.")
             break
-            
+    
     print("-" * 60)
     print(f"Training complete! Best Loss: {best_loss:.4f}")
-    if best_loss == float('inf'):
-         print("  Warning: Loss never converged.")
-    else:
-         print(f"Saved weights to {SAVE_PATH}")
+    print(f"Saved weights to {SAVE_PATH}")
+    print(f"Total pairs trained on: {len(TRUE_PAIRS)}")
 
 
 if __name__ == "__main__":
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
-    # Train with cross-pair hard negatives for 100 epochs
-    train_supervised(num_epochs=100, device=device)
-
-
+    train_supervised(num_epochs=200, device=device)

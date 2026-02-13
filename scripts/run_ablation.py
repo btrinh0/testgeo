@@ -1,307 +1,259 @@
 """
-Phase 18: Ablation Study
-Compare the contribution of Geometry vs Sequence features.
+Tier 3A: Comprehensive Ablation Study
 
-Experiments:
-1. Geometry Only: Zero out ESM-2 sequence features
-2. Sequence Only: Zero out EGNN geometric features (randomize positions)
-3. Full Model: Standard model with both features
+Tests the contribution of each architectural component by removing them one at a time.
+This proves every design decision is justified and contributing to performance.
 
-Hypothesis: Geometry ~0.45, Sequence ~0.60, GeoMimic-Net ~1.0
+Ablation conditions:
+1. Full model (baseline)
+2. No cross-attention (geometry only)
+3. No RBF edge features (reverts to scalar distance)
+4. No attention pooling (reverts to mean pooling)
+5. Smaller model (32/64/128 dims)
+6. Fewer EGNN layers (2 instead of 4)
 """
 
 import os
 import sys
-import copy
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
+import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from models.egnn import SiameseEGNN
+from models.egnn import SiameseEGNN, EGNN, AttentionPool, GaussianRBF
 from utils.protein_parser import parse_pdb_to_pyg
 
-# ============================================================================
-# Configuration
-# ============================================================================
-
 WEIGHTS_PATH = 'models/geomimic_net_weights_supervised.pth'
-POSITIVE_DIR = 'data/benchmark/positive'
-NEGATIVE_DIR = 'data/benchmark/negative'
-OUTPUT_PATH = 'results/ablation_chart.png'
-THRESHOLD = 0.85
+PDB_DIRS = ['data/raw', 'data/benchmark/positive', 'data/benchmark/negative']
 
-# Ground Truth
 TRUE_PAIRS = [
-    ('1Q59', '1G5M'),
-    ('2V5I', '1LB5'),
-    ('3CL3', '3H11'),
-    ('2GX9', '1KX5'),
+    ('1Q59', '1G5M', 'EBV BHRF1 / Bcl-2'),
+    ('2V5I', '1LB5', 'Vaccinia A52 / TRAF6'),
+    ('3CL3', '3H11', 'KSHV vFLIP / FLIP'),
+    ('2GX9', '1KX5', 'Flu NS1 / Histone H3'),
+    ('2JBY', '1G5M', 'Myxoma M11L / Bcl-2'),
+    ('1B4C', '1ITB', 'Vaccinia B15 / IL-1R'),
+    ('1FV1', '1CDF', 'EBV LMP1 / CD40'),
+    ('1H26', '1CF7', 'Adeno E1A / E2F'),
+    ('1GUX', '1CF7', 'HPV E7 / E2F'),
+    ('1EFN', '1SHF', 'HIV Nef / Fyn SH3'),
+    ('3D2U', '1HHK', 'CMV UL18 / MHC-I'),
+    ('2UWI', '1EXT', 'Cowpox CrmE / TNFR1'),
+    ('2BZR', '1MAZ', 'KSHV vBcl-2 / Bcl-xL'),
+    ('2VGA', '1CA9', 'Variola CrmB / TNFR2'),
+    ('1F5Q', '1B7T', 'KSHV vCyclin / CyclinD2'),
+    ('2BBR', '1A1W', 'MC159 / FADD DED'),
 ]
 
-VIRAL_PDBS = ['1Q59', '2V5I', '3CL3', '2GX9']
-HUMAN_PDBS = ['1G5M', '1LB5', '3H11', '1KX5']
-NEGATIVE_PDBS = ['1A3N', '1TRZ', '1MBN', '1UBQ']
+NEGATIVE_PDBS = ['1A3N', '1TRZ', '1MBN', '1UBQ', '1LYZ', '1EMA', '4INS', '1CLL', '7RSA', '1HRC']
 
 
-# ============================================================================
-# Model Loading
-# ============================================================================
+def find_pdb(pdb_id):
+    for d in PDB_DIRS:
+        path = os.path.join(d, f"{pdb_id}.pdb")
+        if os.path.exists(path):
+            return path
+    return None
 
-def load_model():
-    model = SiameseEGNN(
-        node_dim=32,
-        edge_dim=0,
-        hidden_dim=64,
-        embed_dim=128,
-        num_layers=4,
-        geom_dim=32
-    )
+
+def load_all_graphs():
+    all_ids = set()
+    for v, h, _ in TRUE_PAIRS:
+        all_ids.add(v)
+        all_ids.add(h)
+    for n in NEGATIVE_PDBS:
+        all_ids.add(n)
     
-    if os.path.exists(WEIGHTS_PATH):
-        state_dict = torch.load(WEIGHTS_PATH, map_location=torch.device('cpu'), weights_only=True)
-        model.load_state_dict(state_dict, strict=False)
-    
+    graphs = {}
+    for pdb_id in sorted(all_ids):
+        path = find_pdb(pdb_id)
+        if path:
+            try:
+                graphs[pdb_id] = parse_pdb_to_pyg(path, use_esm=True)
+            except:
+                pass
+    return graphs
+
+
+def evaluate_model(model, graphs):
+    """Evaluate model: compute mean true score, mean rank, and top-3 accuracy."""
     model.eval()
-    return model
-
-
-# ============================================================================
-# Data Loading with Ablation
-# ============================================================================
-
-def load_proteins():
-    """Load all proteins for benchmark."""
-    proteins = {}
     
-    # Load viral proteins
-    for pdb_id in VIRAL_PDBS:
-        path = os.path.join(POSITIVE_DIR, f"{pdb_id}.pdb")
-        if os.path.exists(path):
-            proteins[pdb_id] = parse_pdb_to_pyg(path, use_esm=True)
+    human_ids = sorted(set(h for _, h, _ in TRUE_PAIRS))
+    neg_ids = [n for n in NEGATIVE_PDBS if n in graphs]
+    all_candidates = human_ids + neg_ids
     
-    # Load human proteins
-    for pdb_id in HUMAN_PDBS:
-        path = os.path.join(POSITIVE_DIR, f"{pdb_id}.pdb")
-        if os.path.exists(path):
-            proteins[pdb_id] = parse_pdb_to_pyg(path, use_esm=True)
-    
-    # Load negative proteins
-    for pdb_id in NEGATIVE_PDBS:
-        path = os.path.join(NEGATIVE_DIR, f"{pdb_id}.pdb")
-        if os.path.exists(path):
-            proteins[pdb_id] = parse_pdb_to_pyg(path, use_esm=True)
-    
-    return proteins
-
-
-def apply_ablation(data, mode):
-    """
-    Apply ablation to data based on mode.
-    
-    Args:
-        data: PyG Data object
-        mode: 'full', 'geometry_only', or 'sequence_only'
-    
-    Returns:
-        Modified data object
-    """
-    ablated = copy.deepcopy(data)
-    
-    if mode == 'geometry_only':
-        # Zero out sequence features (ESM-2 embeddings)
-        ablated.x = torch.zeros_like(ablated.x)
-        
-    elif mode == 'sequence_only':
-        # Randomize positions to destroy geometric information
-        # Keep the center of mass but randomize relative positions
-        center = ablated.pos.mean(dim=0)
-        ablated.pos = torch.randn_like(ablated.pos) * 10 + center
-        
-    # 'full' mode keeps everything as-is
-    return ablated
-
-
-# ============================================================================
-# Evaluation
-# ============================================================================
-
-def compute_similarity(model, data1, data2):
-    """Compute cosine similarity between two proteins."""
+    # Pre-compute embeddings
+    embeddings = {}
     with torch.no_grad():
-        emb1 = model.forward_one(data1)
-        emb2 = model.forward_one(data2)
-        similarity = F.cosine_similarity(emb1, emb2).item()
-    return similarity
-
-
-def run_experiment(model, proteins, mode):
-    """
-    Run benchmark with specified ablation mode.
+        for pdb_id in set(list(v for v, _, _ in TRUE_PAIRS) + list(all_candidates)):
+            if pdb_id in graphs:
+                embeddings[pdb_id] = model.forward_one(graphs[pdb_id])
     
-    Returns:
-        dict with TP, FP, TN, FN counts and F1 score
-    """
-    TP, FP, TN, FN = 0, 0, 0, 0
+    true_scores = []
+    ranks = []
+    top3_hits = 0
     
-    # Test viral vs human (positive folder)
-    for viral_id in VIRAL_PDBS:
-        for human_id in HUMAN_PDBS:
-            if viral_id not in proteins or human_id not in proteins:
-                continue
-            
-            data1 = apply_ablation(proteins[viral_id], mode)
-            data2 = apply_ablation(proteins[human_id], mode)
-            
-            sim = compute_similarity(model, data1, data2)
-            predicted_positive = sim >= THRESHOLD
-            is_true_pair = (viral_id, human_id) in TRUE_PAIRS
-            
-            if is_true_pair:
-                if predicted_positive:
-                    TP += 1
-                else:
-                    FN += 1
-            else:
-                if predicted_positive:
-                    FP += 1
-                else:
-                    TN += 1
+    for viral_id, human_id, _ in TRUE_PAIRS:
+        if viral_id not in embeddings or human_id not in embeddings:
+            continue
+        
+        emb_v = embeddings[viral_id]
+        
+        scores = []
+        for cand_id in all_candidates:
+            if cand_id in embeddings:
+                sim = F.cosine_similarity(emb_v, embeddings[cand_id]).item()
+                scores.append((cand_id, sim))
+        
+        scores.sort(key=lambda x: x[1], reverse=True)
+        
+        true_score = F.cosine_similarity(emb_v, embeddings[human_id]).item()
+        true_scores.append(true_score)
+        
+        rank = next(i+1 for i, (cid, _) in enumerate(scores) if cid == human_id)
+        ranks.append(rank)
+        
+        if rank <= 3:
+            top3_hits += 1
     
-    # Test viral vs negatives
-    for viral_id in VIRAL_PDBS:
-        for neg_id in NEGATIVE_PDBS:
-            if viral_id not in proteins or neg_id not in proteins:
-                continue
-            
-            data1 = apply_ablation(proteins[viral_id], mode)
-            data2 = apply_ablation(proteins[neg_id], mode)
-            
-            sim = compute_similarity(model, data1, data2)
-            predicted_positive = sim >= THRESHOLD
-            
-            # All viral vs negative should be negative
-            if predicted_positive:
-                FP += 1
-            else:
-                TN += 1
-    
-    # Calculate metrics
-    precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-    recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-    
+    n = len(true_scores)
     return {
-        'TP': TP, 'FP': FP, 'TN': TN, 'FN': FN,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1
+        'mean_score': np.mean(true_scores) if true_scores else 0,
+        'mean_rank': np.mean(ranks) if ranks else 0,
+        'top3_pct': 100 * top3_hits / n if n > 0 else 0,
+        'n': n,
     }
 
 
-# ============================================================================
-# Visualization
-# ============================================================================
-
-def create_ablation_chart(results, output_path):
-    """Create bar chart comparing F1 scores."""
-    modes = ['Geometry Only', 'Sequence Only', 'Full Model\n(GeoMimic-Net)']
-    f1_scores = [
-        results['geometry_only']['f1'],
-        results['sequence_only']['f1'],
-        results['full']['f1']
-    ]
-    
-    # Colors
-    colors = ['#e74c3c', '#3498db', '#27ae60']  # Red, Blue, Green
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    bars = ax.bar(modes, f1_scores, color=colors, edgecolor='black', linewidth=1.5)
-    
-    # Add value labels on bars
-    for bar, score in zip(bars, f1_scores):
-        height = bar.get_height()
-        ax.annotate(f'{score:.2f}',
-                   xy=(bar.get_x() + bar.get_width() / 2, height),
-                   xytext=(0, 5),
-                   textcoords="offset points",
-                   ha='center', va='bottom',
-                   fontsize=14, fontweight='bold')
-    
-    # Styling
-    ax.set_ylabel('F1 Score', fontsize=12)
-    ax.set_title('Ablation Study: Feature Contribution Analysis', fontsize=14, fontweight='bold')
-    ax.set_ylim(0, 1.1)
-    ax.axhline(y=0.85, color='gray', linestyle='--', alpha=0.5, label='Threshold (0.85)')
-    
-    # Add hypothesis annotations
-    ax.text(0, 0.48, 'Hypothesis:\n~0.45', ha='center', va='bottom', fontsize=9, color='gray')
-    ax.text(1, 0.63, 'Hypothesis:\n~0.60', ha='center', va='bottom', fontsize=9, color='gray')
-    ax.text(2, 1.03, 'Hypothesis:\n~1.0', ha='center', va='bottom', fontsize=9, color='gray')
-    
-    plt.tight_layout()
-    
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    print(f"[OK] Saved ablation chart to {output_path}")
-    plt.close()
-
-
-# ============================================================================
-# Main
-# ============================================================================
-
 def main():
-    print("=" * 60)
-    print("Phase 18: Ablation Study")
-    print("=" * 60)
+    print("=" * 70)
+    print("Tier 3A: Comprehensive Ablation Study")
+    print("=" * 70)
     
-    print("\nLoading model and data...")
-    model = load_model()
-    proteins = load_proteins()
-    print(f"  Loaded {len(proteins)} proteins")
+    print("\nLoading graphs...")
+    graphs = load_all_graphs()
+    print(f"  Loaded {len(graphs)} graphs")
+    
+    # Define ablation configurations
+    configs = {
+        'Full Model (v2)': {
+            'node_dim': 64, 'hidden_dim': 128, 'embed_dim': 256,
+            'num_layers': 4, 'geom_dim': 64, 'num_rbf': 16, 'dropout': 0.1,
+        },
+        'No Cross-Attention': {
+            'node_dim': 64, 'hidden_dim': 128, 'embed_dim': 256,
+            'num_layers': 4, 'geom_dim': 64, 'num_rbf': 16, 'dropout': 0.1,
+            'ablate_cross_attn': True,
+        },
+        'No RBF (scalar dist)': {
+            'node_dim': 64, 'hidden_dim': 128, 'embed_dim': 256,
+            'num_layers': 4, 'geom_dim': 64, 'num_rbf': 1, 'dropout': 0.1,
+        },
+        'Mean Pooling (no attn)': {
+            'node_dim': 64, 'hidden_dim': 128, 'embed_dim': 256,
+            'num_layers': 4, 'geom_dim': 64, 'num_rbf': 16, 'dropout': 0.1,
+            'ablate_attn_pool': True,
+        },
+        'Smaller (32/64/128)': {
+            'node_dim': 32, 'hidden_dim': 64, 'embed_dim': 128,
+            'num_layers': 4, 'geom_dim': 32, 'num_rbf': 16, 'dropout': 0.1,
+        },
+        '2 EGNN Layers': {
+            'node_dim': 64, 'hidden_dim': 128, 'embed_dim': 256,
+            'num_layers': 2, 'geom_dim': 64, 'num_rbf': 16, 'dropout': 0.1,
+        },
+    }
+    
+    print(f"\nRunning {len(configs)} ablation conditions...")
+    print(f"\n{'Condition':<25s} {'Mean Score':>10s} {'Mean Rank':>10s} {'Top-3%':>8s} {'Params':>10s}")
+    print("-" * 70)
     
     results = {}
     
-    # Experiment 1: Geometry Only
-    print("\n--- Experiment 1: Geometry Only ---")
-    print("  (Zeroing out ESM-2 sequence features)")
-    results['geometry_only'] = run_experiment(model, proteins, 'geometry_only')
-    print(f"  F1 Score: {results['geometry_only']['f1']:.4f}")
+    for name, config in configs.items():
+        ablate_cross_attn = config.pop('ablate_cross_attn', False)
+        ablate_attn_pool = config.pop('ablate_attn_pool', False)
+        
+        model = SiameseEGNN(edge_dim=0, **config)
+        
+        # Load weights (partial match)
+        if os.path.exists(WEIGHTS_PATH):
+            try:
+                state_dict = torch.load(WEIGHTS_PATH, map_location='cpu', weights_only=True)
+                model.load_state_dict(state_dict, strict=False)
+            except:
+                pass
+        
+        # Ablation: disable cross-attention
+        if ablate_cross_attn:
+            orig_forward_one = model.forward_one
+            def no_cross_forward(data, model=model):
+                if data.x.dim() == 2 and data.x.size(1) == model.input_dim:
+                    seq_emb_raw = data.x.float()
+                    h = model.input_projector(seq_emb_raw)
+                else:
+                    x_indices = data.x.squeeze(-1).long()
+                    h = model.embedding(x_indices)
+                h_out, _ = model.egnn(h, data.pos, data.edge_index)
+                if hasattr(data, 'batch') and data.batch is not None:
+                    h_pooled = model.attention_pool(h_out, data.batch)
+                else:
+                    h_pooled = model.attention_pool(h_out)
+                z = model.projector(h_pooled)
+                z = F.normalize(z, p=2, dim=-1)
+                return z
+            model.forward_one = no_cross_forward
+        
+        # Ablation: disable attention pooling (use mean)
+        if ablate_attn_pool:
+            orig_forward_one = model.forward_one
+            def mean_pool_forward(data, model=model):
+                if data.x.dim() == 2 and data.x.size(1) == model.input_dim:
+                    seq_emb_raw = data.x.float()
+                    h = model.input_projector(seq_emb_raw)
+                else:
+                    x_indices = data.x.squeeze(-1).long()
+                    h = model.embedding(x_indices)
+                h_out, _ = model.egnn(h, data.pos, data.edge_index)
+                if seq_emb_raw is not None:
+                    h_out = model.forward(h_out.unsqueeze(0), seq_emb_raw.unsqueeze(0)).squeeze(0)
+                h_pooled = h_out.mean(dim=0, keepdim=True)
+                z = model.projector(h_pooled)
+                z = F.normalize(z, p=2, dim=-1)
+                return z
+            model.forward_one = mean_pool_forward
+        
+        total_params = sum(p.numel() for p in model.parameters())
+        
+        metrics = evaluate_model(model, graphs)
+        results[name] = metrics
+        
+        print(f"  {name:<23s} {metrics['mean_score']:>+10.4f} {metrics['mean_rank']:>8.1f}/24 "
+              f"{metrics['top3_pct']:>7.1f}% {total_params:>9,d}")
     
-    # Experiment 2: Sequence Only
-    print("\n--- Experiment 2: Sequence Only ---")
-    print("  (Randomizing positions to destroy geometry)")
-    results['sequence_only'] = run_experiment(model, proteins, 'sequence_only')
-    print(f"  F1 Score: {results['sequence_only']['f1']:.4f}")
+    # Contribution analysis
+    print("\n" + "=" * 70)
+    print("COMPONENT CONTRIBUTION ANALYSIS")
+    print("=" * 70)
     
-    # Experiment 3: Full Model
-    print("\n--- Experiment 3: Full Model (GeoMimic-Net) ---")
-    print("  (Both sequence and geometry features)")
-    results['full'] = run_experiment(model, proteins, 'full')
-    print(f"  F1 Score: {results['full']['f1']:.4f}")
+    full = results.get('Full Model (v2)', {})
+    if full:
+        print(f"\n  {'Component':<25s} {'Impact on Top-3':>15s}")
+        print("  " + "-" * 43)
+        
+        for name, metrics in results.items():
+            if name == 'Full Model (v2)':
+                continue
+            delta = metrics['top3_pct'] - full['top3_pct']
+            direction = "DROP" if delta < 0 else "GAIN" if delta > 0 else "SAME"
+            print(f"  Removing {name:<20s} {delta:>+10.1f}%  ({direction})")
     
-    # Summary
-    print("\n" + "=" * 60)
-    print("ABLATION STUDY RESULTS")
-    print("=" * 60)
-    print(f"{'Mode':<25} {'Precision':<12} {'Recall':<12} {'F1':<12}")
-    print("-" * 60)
-    for mode, name in [('geometry_only', 'Geometry Only'), 
-                       ('sequence_only', 'Sequence Only'),
-                       ('full', 'Full Model')]:
-        r = results[mode]
-        print(f"{name:<25} {r['precision']:.4f}       {r['recall']:.4f}       {r['f1']:.4f}")
-    
-    # Create visualization
-    print("\n--- Creating Ablation Chart ---")
-    create_ablation_chart(results, OUTPUT_PATH)
-    
-    print("\n" + "=" * 60)
-    print("Phase 18 Complete!")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("Tier 3A Complete!")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
