@@ -78,48 +78,48 @@ PDB_DIRS = [RAW_DIR, POSITIVE_DIR, NEGATIVE_DIR]
 
 
 # ============================================================================
-# NT-Xent Loss (from SimCLR)
+# Soft-Margin Triplet Loss (NEVER reaches zero)
 # ============================================================================
 
-class NTXentLoss(nn.Module):
+class SoftMarginTripletLoss(nn.Module):
     """
-    Normalized Temperature-Scaled Cross Entropy Loss (NT-Xent).
+    Soft-margin triplet loss: L = log(1 + exp(d_pos - d_neg))
     
-    Better than triplet loss because it considers ALL negatives simultaneously
-    rather than just one. This gives the model more information per batch.
+    Unlike TripletMarginLoss (which has a hard margin and reaches 0),
+    this loss asymptotically approaches 0 but NEVER reaches it.
+    This ensures gradient signal flows throughout ALL training epochs.
     
-    L = -log( exp(sim(a,p)/t) / sum(exp(sim(a,n_k)/t)) )
+    Combined with multi-negative hard mining: forward K negatives,
+    compute loss against each, take the MAX (hardest) loss per sample.
     """
-    def __init__(self, temperature=0.07):
+    def __init__(self):
         super().__init__()
-        self.temperature = temperature
     
     def forward(self, anchor, positive, negatives_list):
         """
         Args:
-            anchor: [B, D] anchor embeddings
+            anchor: [B, D] anchor embeddings  
             positive: [B, D] positive embeddings
             negatives_list: list of [B, D] negative embeddings
         """
-        # Positive similarity
-        pos_sim = F.cosine_similarity(anchor, positive, dim=-1) / self.temperature  # [B]
+        # Use cosine similarity (not L2 distance) for more stable gradients
+        pos_sim = F.cosine_similarity(anchor, positive, dim=-1)  # [B], want HIGH
         
-        # Negative similarities
-        neg_sims = []
+        # Compute loss against each negative, take the hardest
+        losses = []
         for neg in negatives_list:
-            neg_sim = F.cosine_similarity(anchor, neg, dim=-1) / self.temperature  # [B]
-            neg_sims.append(neg_sim)
+            neg_sim = F.cosine_similarity(anchor, neg, dim=-1)  # [B], want LOW
+            # Soft margin: log(1 + exp(neg_sim - pos_sim))
+            # When pos_sim >> neg_sim: loss -> 0 (but never exactly 0)
+            # When neg_sim >= pos_sim: loss is large (model confused)
+            pair_loss = torch.log1p(torch.exp(neg_sim - pos_sim))
+            losses.append(pair_loss)
         
-        # Stack: [B, 1+K] where K is number of negatives
-        all_sims = torch.stack([pos_sim] + neg_sims, dim=1)  # [B, 1+K]
+        # Stack and take max across negatives (hardest negative per sample)
+        loss_stack = torch.stack(losses, dim=1)  # [B, K]
+        hardest_loss = loss_stack.max(dim=1).values  # [B]
         
-        # Labels: positive is always index 0
-        labels = torch.zeros(anchor.size(0), dtype=torch.long, device=anchor.device)
-        
-        # Cross entropy loss
-        loss = F.cross_entropy(all_sims, labels)
-        
-        return loss
+        return hardest_loss.mean()
 
 
 # ============================================================================
@@ -385,7 +385,7 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
         num_layers=4,
         geom_dim=64,        # Was 32
         num_rbf=16,         # NEW: RBF edge features
-        dropout=0.1         # NEW: regularization
+        dropout=0.2         # Increased from 0.1 to reduce overfitting
     ).to(device)
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -402,9 +402,8 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
             print(f"  [INFO] Could not load weights: {e}")
             print("  Training from scratch with new architecture.")
     
-    # Triplet Margin Loss with hard negative mining
-    # Proven approach: margin=1.0 keeps gradients flowing, multi-neg mining picks hardest
-    criterion = nn.TripletMarginLoss(margin=1.0, p=2)
+    # Soft-Margin Triplet Loss (never reaches 0, always provides gradients)
+    criterion = SoftMarginTripletLoss()
     
     # Optimizer with weight decay
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
@@ -420,8 +419,8 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
     print(f"  Epochs:        {num_epochs}")
     print(f"  Batch size:    {batch_size}")
     print(f"  Batches/epoch: {num_batches}")
-    print(f"  Negatives/sample: {num_negatives} (hardest selected)")
-    print(f"  Loss:          TripletMargin (margin=1.0) + hard mining")
+    print(f"  Negatives/sample: {num_negatives} (hardest selected by loss)")
+    print(f"  Loss:          SoftMarginTriplet (log1p, never reaches 0)")
     print(f"  LR:            {learning_rate} -> cosine annealing")
     print(f"  Curriculum:    20% hard(1-30) -> ramp(30-100) -> 80% hard(100+)")
     print("-" * 60)
@@ -463,18 +462,8 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
             z_p = model.forward_one(p_batch)
             z_neg_list = [model.forward_one(nb) for nb in neg_batches]
             
-            # Hard negative mining: pick the negative closest to anchor
-            # This is the hardest negative - the one the model struggles with most
-            neg_dists = [F.pairwise_distance(z_a, z_neg, p=2) for z_neg in z_neg_list]
-            neg_dists_stack = torch.stack(neg_dists, dim=1)  # [B, K]
-            hardest_idx = neg_dists_stack.argmin(dim=1)  # [B] - closest = hardest
-            
-            # Gather hardest negative per sample
-            z_neg_stack = torch.stack(z_neg_list, dim=1)  # [B, K, D]
-            z_hard_neg = z_neg_stack[torch.arange(z_a.size(0)), hardest_idx]  # [B, D]
-            
-            # Triplet loss with hardest negative
-            loss = criterion(z_a, z_p, z_hard_neg)
+            # SoftMarginTripletLoss handles hard mining internally
+            loss = criterion(z_a, z_p, z_neg_list)
             
             loss.backward()
             
