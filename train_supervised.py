@@ -402,8 +402,8 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
             print(f"  [INFO] Could not load weights: {e}")
             print("  Training from scratch with new architecture.")
     
-    # NT-Xent Loss
-    criterion = NTXentLoss(temperature=0.07)
+    # NT-Xent Loss (temperature=0.5, standard SimCLR value; 0.07 was too low causing loss collapse)
+    criterion = NTXentLoss(temperature=0.5)
     
     # Optimizer with weight decay
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
@@ -420,26 +420,30 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
     print(f"  Batch size:    {batch_size}")
     print(f"  Batches/epoch: {num_batches}")
     print(f"  Negatives/sample: {num_negatives}")
-    print(f"  Loss:          NT-Xent (temperature=0.07)")
+    print(f"  Loss:          NT-Xent (temperature=0.5)")
     print(f"  LR:            {learning_rate} -> cosine annealing")
-    print(f"  Curriculum:    Easy(1-50) -> Mixed(50-150) -> Hard(150+)")
+    print(f"  Curriculum:    30% hard(1-30) -> ramp(30-100) -> 90% hard(100+)")
     print("-" * 60)
     
     best_loss = float('inf')
     patience_counter = 0
-    early_stop_patience = 40      # Was 20 - too aggressive for new architecture
-    min_epochs_before_stop = 100  # Don't allow early stopping before epoch 100
+    early_stop_patience = 40
+    min_epochs_before_stop = 100
+    loss_collapsed = False  # Track if loss hit zero (need harder negatives)
     
     for epoch in range(1, num_epochs + 1):
         epoch_loss = 0.0
         
         # Curriculum learning: gradually increase hard negative ratio
-        if epoch <= 50:
-            hard_ratio = 0.1  # Phase 1: mostly easy negatives
-        elif epoch <= 150:
-            hard_ratio = 0.3 + 0.4 * ((epoch - 50) / 100)  # Phase 2: ramp up
+        # Start with 30% hard (not 10%!) to prevent trivial loss collapse
+        if loss_collapsed:
+            hard_ratio = 0.9  # If loss hit zero, force hard negatives
+        elif epoch <= 30:
+            hard_ratio = 0.3  # Phase 1: moderate difficulty
+        elif epoch <= 100:
+            hard_ratio = 0.3 + 0.6 * ((epoch - 30) / 70)  # Phase 2: ramp to 90%
         else:
-            hard_ratio = 0.8  # Phase 3: mostly hard negatives
+            hard_ratio = 0.9  # Phase 3: mostly hard negatives
         
         for _ in range(num_batches):
             a_batch, p_batch, neg_batches = create_ntxent_batch(
@@ -478,6 +482,11 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
         
         avg_loss = epoch_loss / num_batches
         current_lr = optimizer.param_groups[0]['lr']
+        
+        # Detect loss collapse and force harder negatives
+        if avg_loss < 1e-6 and not loss_collapsed:
+            loss_collapsed = True
+            print(f"  [!] Loss collapsed to ~0 at epoch {epoch}. Switching to 90% hard negatives.")
         
         if avg_loss < best_loss:
             best_loss = avg_loss
