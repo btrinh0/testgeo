@@ -427,7 +427,8 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
     
     best_loss = float('inf')
     patience_counter = 0
-    early_stop_patience = 20
+    early_stop_patience = 40      # Was 20 - too aggressive for new architecture
+    min_epochs_before_stop = 100  # Don't allow early stopping before epoch 100
     
     for epoch in range(1, num_epochs + 1):
         epoch_loss = 0.0
@@ -488,13 +489,13 @@ def train_supervised(num_epochs=200, batch_size=64, learning_rate=3e-4,
             patience_counter += 1
             marker = ""
         
-        if epoch % 10 == 0 or epoch == 1 or epoch <= 5:
+        if epoch % 5 == 0 or epoch == 1 or epoch <= 5:
             print(f"Epoch {epoch:3d}/{num_epochs} | Loss: {avg_loss:.4f} | "
                   f"LR: {current_lr:.2e} | Hard: {hard_ratio:.0%}{marker}")
         
-        # Early stopping
-        if patience_counter >= early_stop_patience:
-            print(f"\n[EARLY STOP] No improvement for {early_stop_patience} epochs.")
+        # Early stopping (only after minimum epochs)
+        if epoch >= min_epochs_before_stop and patience_counter >= early_stop_patience:
+            print(f"\n[EARLY STOP] No improvement for {early_stop_patience} epochs (after epoch {min_epochs_before_stop}).")
             break
     
     print("-" * 60)
