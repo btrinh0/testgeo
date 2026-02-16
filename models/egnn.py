@@ -287,6 +287,8 @@ class SiameseEGNN(nn.Module):
     def forward_one(self, data):
         """
         Forward pass for a single graph with ESM-2 features.
+        Cross-attention DISABLED: ablation showed it causes dimensional collapse
+        (18.8% Top-3 with cross-attn vs 68.8% without).
         """
         # ========== Input Processing ==========
         seq_emb_raw = None
@@ -304,12 +306,9 @@ class SiameseEGNN(nn.Module):
         # Run through EGNN
         h_out, _ = self.egnn(h, data.pos, data.edge_index)
         
-        # ========== Cross-Attention Fusion ==========
-        if seq_emb_raw is not None:
-            h_out = self.forward(
-                h_out.unsqueeze(0),
-                seq_emb_raw.unsqueeze(0)
-            ).squeeze(0)
+        # Cross-attention DISABLED (causes dimensional collapse)
+        # The EGNN already processes ESM-2 features through input_projector,
+        # so the geometric backbone captures sequence information implicitly.
         
         # ========== Attention Pooling (replaces mean pooling) ==========
         if hasattr(data, 'batch') and data.batch is not None:
