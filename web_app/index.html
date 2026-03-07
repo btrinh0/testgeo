@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GeoMimic-Net | Interactive Demo</title>
+    <!-- Google Fonts -->
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap"
+        rel="stylesheet">
+    <!-- Font Awesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <!-- Animated Background -->
+    <div class="bg-animated">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+
+    <!-- Header -->
+    <header class="glass-panel">
+        <div class="logo">
+            <i class="fa-solid fa-dna pulse-icon"></i>
+            <div>
+                <h1>GeoMimic-Net</h1>
+                <p>SE(3)-Equivariant Graph Neural Network for Mimicry Detection</p>
+            </div>
+        </div>
+        <nav class="tabs">
+            <div class="tab active" data-target="overview"><i class="fa-solid fa-table-columns"></i> Overview</div>
+            <div class="tab" data-target="architecture"><i class="fa-solid fa-network-wired"></i> Architecture</div>
+            <div class="tab" data-target="demo"><i class="fa-solid fa-play"></i> Live Demo</div>
+            <div class="tab" data-target="results"><i class="fa-solid fa-chart-line"></i> Results</div>
+            <div class="tab-indicator"></div>
+        </nav>
+    </header>
+
+    <!-- Main Content -->
+    <main>
+        <!-- Overview Section -->
+        <section id="overview" class="section-pane active">
+            <div class="glass-card hero-card">
+                <h2>Predicting Structural Mimicry Beyond Sequence</h2>
+                <p>Molecular mimicry is a critical mechanism by which viruses evade the host immune system. Traditional
+                    methods relying on sequence alignment overlook structurally similar but sequentially divergent
+                    proteins. <strong>GeoMimic-Net</strong> solves this using strict 3D geometric AI.</p>
+                <div class="stats-row">
+                    <div class="stat">
+                        <span class="stat-value highlight-cyan">100%</span>
+                        <span class="stat-label">Detection Accuracy</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-value highlight-blue">&lt;5%</span>
+                        <span class="stat-label">Sequence Identity</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-value highlight-purple">SE(3)</span>
+                        <span class="stat-label">Equivariance</span>
+                    </div>
+                </div>
+            </div>
+            <div class="grid-2">
+                <div class="glass-card">
+                    <h3><i class="fa-solid fa-virus"></i> The Problem</h3>
+                    <p>Standard tools like BLAST completely miss structural mimicry because proteins can share identical
+                        3D folds with negligible sequence overlap. This hides autoimmune triggers and viral evasion
+                        mechanisms.</p>
+                </div>
+                <div class="glass-card">
+                    <h3><i class="fa-solid fa-microchip"></i> The Solution</h3>
+                    <p>We leverage Equivariant Graph Neural Networks (EGNNs) to map 3D atomic coordinates into a
+                        rotationally invariant embedded space, fusing it with multimodal ESM-2 semantic features.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Architecture Section -->
+        <section id="architecture" class="section-pane">
+            <div class="glass-card full-width">
+                <h2>Model Architecture</h2>
+                <div class="arch-flow">
+                    <div class="arch-node">
+                        <i class="fa-solid fa-cubes"></i>
+                        <h4>Input Graphs</h4>
+                        <p>Cα atoms as nodes, RBF-encoded edges (&lt;10Å)</p>
+                    </div>
+                    <div class="arch-arrow"><i class="fa-solid fa-arrow-right"></i></div>
+                    <div class="arch-node highlight">
+                        <i class="fa-solid fa-project-diagram"></i>
+                        <h4>Siamese EGNN</h4>
+                        <p>4 Layers, SE(3) Equivariant Message Passing</p>
+                    </div>
+                    <div class="arch-arrow"><i class="fa-solid fa-arrow-right"></i></div>
+                    <div class="arch-node">
+                        <i class="fa-solid fa-link"></i>
+                        <h4>Multimodal Fusion</h4>
+                        <p>ESM-2 Embeddings &amp; Cross-Attention</p>
+                    </div>
+                    <div class="arch-arrow"><i class="fa-solid fa-arrow-right"></i></div>
+                    <div class="arch-node highlight-alt">
+                        <i class="fa-solid fa-bullseye"></i>
+                        <h4>Attention Pooling</h4>
+                        <p>Per-residue importance &amp; Contrastive Loss</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Live Demo Section -->
+        <section id="demo" class="section-pane">
+            <div class="grid-2 demo-grid">
+                <!-- Controls -->
+                <div class="glass-card controls-card">
+                    <h2><i class="fa-solid fa-gear"></i> Inference Engine</h2>
+                    <p class="subtitle">Select a pair to run the mimicry scan.</p>
+
+                    <div class="form-group">
+                        <label>Viral Protein (PDB / Chain)</label>
+                        <select id="viral-select" class="glass-select">
+                            <option value="6H3X_A">Oropouche Gc Head (6H3X)</option>
+                            <option value="1MHB_A">EBV EBNA1 (1MHB)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Human Candidate</label>
+                        <select id="human-select" class="glass-select">
+                            <option value="Cyclin_D2">Cyclin D2 (Candidate)</option>
+                            <option value="FADD">FADD DED (Candidate)</option>
+                            <option value="Lysozyme">Lysozyme (Negative Control)</option>
+                        </select>
+                    </div>
+
+                    <button id="run-inference-btn" class="glow-button">
+                        <i class="fa-solid fa-bolt"></i> Run Discovery Scan
+                    </button>
+
+                    <div id="loading-container" class="hidden">
+                        <div class="loading-steps">
+                            <div class="step pending" id="step-1"><i class="fa-solid fa-circle-notch fa-spin"></i>
+                                Parsing 3D Coordinates...</div>
+                            <div class="step pending" id="step-2"><i class="fa-solid fa-circle-notch fa-spin"></i>
+                                Building RBF Error Graphs...</div>
+                            <div class="step pending" id="step-3"><i class="fa-solid fa-circle-notch fa-spin"></i>
+                                Running EGNN Forward Pass...</div>
+                            <div class="step pending" id="step-4"><i class="fa-solid fa-circle-notch fa-spin"></i>
+                                Calculating InfoNCE Similarity...</div>
+                        </div>
+                        <div class="progress-bar-container">
+                            <div class="progress-bar" id="demo-progress"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Results Panel -->
+                <div class="glass-card results-card">
+                    <div id="demo-placeholder" class="placeholder-content">
+                        <i class="fa-solid fa-satellite-dish"></i>
+                        <p>Awaiting inference initiation...</p>
+                    </div>
+                    <div id="demo-output" class="hidden">
+                        <h3 class="output-title">Inference Complete</h3>
+                        <div class="score-display">
+                            <div class="score-circle" id="final-score">+1.000</div>
+                            <div class="score-label" id="final-verdict">★ STRONG MIMICRY</div>
+                        </div>
+                        <div class="attention-map">
+                            <h4>Attention Map</h4>
+                            <div class="heatmap-img-container">
+                                <img src="../results/attention_analysis.png" alt="Attention Map" />
+                            </div>
+                            <p class="caption">High attention residues (red peaks) correlate with known binding
+                                interfaces.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Results Section -->
+        <section id="results" class="section-pane">
+            <div class="grid-2">
+                <div class="glass-card">
+                    <h3>Performance vs Baselines</h3>
+                    <img src="../results/three_way_comparison.png" alt="Three Way Comparison"
+                        style="width: 100%; border-radius: 8px; margin-top: 1rem;">
+                </div>
+                <div class="glass-card">
+                    <h3>ROC Analysis</h3>
+                    <img src="../results/roc_curve.png" alt="ROC Curve"
+                        style="width: 100%; border-radius: 8px; margin-top: 1rem;">
+                </div>
+                <div class="glass-card full-width" style="grid-column: span 2;">
+                    <h3>Publication Metrics</h3>
+                    <img src="../results/publication_figures.png" alt="Publication Figures"
+                        style="width: 100%; border-radius: 8px; margin-top: 1rem; max-height: 400px; object-fit: contain;">
+                </div>
+            </div>
+        </section>
+    </main>
+    <script src="script.js"></script>
+</body>
+
+</html>

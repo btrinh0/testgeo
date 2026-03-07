@@ -15,8 +15,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from models.egnn import SiameseEGNN
 from utils.protein_parser import parse_pdb_to_pyg
 
-WEIGHTS_PATH = 'models/geomimic_net_weights_supervised.pth'
-PDB_DIRS = ['data/raw', 'data/benchmark/positive', 'data/benchmark/negative']
+from config.constants import PDB_DIRS, SUPERVISED_WEIGHTS
+
+WEIGHTS_PATH = SUPERVISED_WEIGHTS
 
 FUNCTIONAL_ANNOTATIONS = {
     '1G5M': [(97, 107, 'BH3 binding groove'), (136, 155, 'BH1 domain'), (187, 202, 'BH2 domain')],
@@ -77,7 +78,7 @@ def main():
     print("=" * 70)
     print("Tier 2B: Functional Site Mapping (Attention Enrichment)")
     print("=" * 70)
-    
+
     model = SiameseEGNN(
         node_dim=64, edge_dim=0, hidden_dim=128,
         embed_dim=256, num_layers=4, geom_dim=64,
@@ -87,12 +88,12 @@ def main():
         state_dict = torch.load(WEIGHTS_PATH, map_location='cpu', weights_only=True)
         model.load_state_dict(state_dict, strict=False)
     model.eval()
-    
+
     print(f"\n{'Pair':<28s} {'Enrichment':>12s} {'Func Attn':>10s} {'Non-Func':>10s} {'Result'}")
     print("-" * 80)
-    
+
     enrichments = []
-    
+
     for viral_id, human_id, name in TRUE_PAIRS:
         if human_id not in FUNCTIONAL_ANNOTATIONS:
             continue
@@ -104,29 +105,29 @@ def main():
             attention = extract_attention(model, data)
             if attention is None:
                 continue
-            
+
             residue_numbers = extract_residue_numbers(human_path)
             annotations = FUNCTIONAL_ANNOTATIONS[human_id]
-            
+
             func_indices = set()
             for start, end, _ in annotations:
                 for i, resnum in enumerate(residue_numbers):
                     if start <= resnum <= end:
                         func_indices.add(i)
-            
+
             if not func_indices or len(func_indices) >= len(attention):
                 continue
-            
+
             func_attn = np.mean([attention[i] for i in func_indices if i < len(attention)])
             non_func_attn = np.mean([attention[i] for i in range(len(attention)) if i not in func_indices])
             enrichment = func_attn / (non_func_attn + 1e-8)
-            
+
             enrichments.append(enrichment)
             verdict = "ENRICHED" if enrichment > 1.0 else "not enriched"
             print(f"  {name:<26s} {enrichment:>10.2f}x  {func_attn:>10.4f} {non_func_attn:>10.4f}  {verdict}")
         except Exception as e:
             print(f"  {name:<26s} [ERROR: {e}]")
-    
+
     if enrichments:
         print("\n" + "=" * 70)
         print("FUNCTIONAL ENRICHMENT SUMMARY")
@@ -138,7 +139,7 @@ def main():
         if np.mean(enrichments) > 1.0:
             print(f"\n  [SIGNIFICANT] Model pays {np.mean(enrichments):.1f}x MORE attention")
             print(f"  to known functional sites than non-functional regions.")
-    
+
     print("\n" + "=" * 70)
     print("Tier 2B Complete!")
     print("=" * 70)

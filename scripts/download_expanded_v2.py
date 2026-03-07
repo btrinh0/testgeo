@@ -46,18 +46,18 @@ def main():
     print("=" * 70)
     os.makedirs(POSITIVE_DIR, exist_ok=True)
     os.makedirs(RAW_DIR, exist_ok=True)
-    
+
     viral_ids = set(v for v, _, _, _, _ in NEW_PAIRS)
     human_ids = set(h for _, h, _, _, _ in NEW_PAIRS)
-    
+
     print("\nDownloading viral proteins...")
     for pdb_id in sorted(viral_ids):
         download_pdb(pdb_id, RAW_DIR)
-    
+
     print("\nDownloading human target proteins...")
     for pdb_id in sorted(human_ids):
         download_pdb(pdb_id, POSITIVE_DIR)
-    
+
     print("\nDone!")
 
 if __name__ == "__main__":
